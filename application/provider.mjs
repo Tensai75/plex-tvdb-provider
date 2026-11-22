@@ -8,6 +8,12 @@ if (!/^tv\.plex\.agents\.custom\.[a-zA-Z0-9.]+$/.test(identifier)) {
 }
 const metadataPath = '/library/metadata';
 const kinds = { 2: 'show', 3: 'season', 4: 'episode' };
+const defaultOrder = 'official';
+const orderLabels = new Map([[defaultOrder, 'Aired'], ['dvd', 'DVD'], ['absolute', 'Absolute']]);
+const orderAliases = new Map([
+  ['default', defaultOrder], ['aired', defaultOrder], ['tvdbairing', defaultOrder],
+  ['tvdbdvd', 'dvd'], ['tvdbabsolute', 'absolute'],
+]);
 
 /** Validates a Plex season, episode, or paging number. */
 const coordinates = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -16,10 +22,10 @@ const numericId = (value) => /^[1-9][0-9]{0,14}$/.test(String(value));
 /** Normalizes a title or alias for exact comparison after ignoring punctuation. */
 const normalize = (name) => String(name || '').normalize('NFKC').toLowerCase()
   .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-/** Builds the Plex rating key from the item type and TheTVDB ID. */
-const itemKey = (type, id) => `${type}-${id}`;
-/** Builds a stable Plex GUID within this provider’s namespace. */
-const guid = (type, id) => `${identifier}://${type}/${itemKey(type, id)}`;
+/** Builds the key with an optional alternate season binding for an episode. */
+const itemKey = (type, id, seasonId) => `${type}-${id}` + (seasonId ? `-${seasonId}` : '');
+/** Builds a stable Plex GUID from the item's canonical key. */
+const guid = (type, ratingKey) => `${identifier}://${type}/${ratingKey}`;
 
 /** Extracts the base language requested by Plex, such as fr from fr-CA. */
 function languageCode(value) {
@@ -46,11 +52,11 @@ function externalIds(record) {
 }
 
 /** Formats the metadata fields and artwork shared by shows, seasons, and episodes. */
-function describe(type, record, title, date) {
+function describe(type, record, title, date, seasonId) {
   if (!numericId(record.id)) throw new RequestError(502, 'TVDB returned an invalid item ID');
-  const ratingKey = itemKey(type, record.id);
+  const ratingKey = itemKey(type, record.id, seasonId);
   return {
-    ratingKey, key: `${metadataPath}/${ratingKey}`, guid: guid(type, record.id), type, title,
+    ratingKey, key: `${metadataPath}/${ratingKey}`, guid: guid(type, ratingKey), type, title,
     ...(date ? { originallyAvailableAt: date, year: Number(date.slice(0, 4)) } : {}),
     ...(record.originalTitle ? { originalTitle: record.originalTitle } : {}),
     summary: [record.overview, 'Metadata provided by TheTVDB\nhttps://thetvdb.com/'].filter(Boolean).join('\n\n'),
@@ -63,13 +69,15 @@ function describe(type, record, title, date) {
 }
 
 /** Formats the Plex parent or grandparent reference for an item. */
-function ancestor(type, item, prefix) {
+function ancestor(type, id, title, prefix) {
+  if (!numericId(id)) throw new RequestError(502, 'TVDB returned an invalid parent ID');
+  const ratingKey = itemKey(type, id);
   return {
     [`${prefix}Type`]: type,
-    [`${prefix}RatingKey`]: item.ratingKey,
-    [`${prefix}Key`]: item.key,
-    [`${prefix}Guid`]: item.guid,
-    [`${prefix}Title`]: item.title,
+    [`${prefix}RatingKey`]: ratingKey,
+    [`${prefix}Key`]: `${metadataPath}/${ratingKey}`,
+    [`${prefix}Guid`]: guid(type, ratingKey),
+    [`${prefix}Title`]: title,
   };
 }
 
@@ -78,38 +86,72 @@ function envelope(items, offset = 0, totalSize = items.length) {
   return { MediaContainer: { identifier, offset, size: items.length, totalSize, Metadata: items } };
 }
 
-/** Selects the official airing-order seasons, including season zero for specials. */
-function airedSeasons(series) {
-  return (series.seasons || []).filter((season) =>
-    numericId(season.id) && coordinates(season.number) && season.type?.type === 'official'
-  ).sort((a, b) => a.number - b.number);
+/** Identifies the Plex order for a TheTVDB season. Named orders use the season-type ID. */
+function seasonOrder(season) {
+  const type = season.type;
+  if (orderLabels.has(type?.type)) return type.type;
+  return numericId(type?.id) ? 'tvdbOrder' + type.id : undefined;
 }
 
-/** Formats a show and advertises TheTVDB Aired ordering. */
+/** Normalizes Plex order aliases while preserving the distinction between default and explicit requests. */
+function requestedOrder(value) {
+  if (value == null || value === '') return undefined;
+  if (typeof value !== 'string') throw new RequestError(400, 'Invalid episode order');
+  const normalized = value.toLowerCase();
+  const known = orderAliases.get(normalized) ?? normalized;
+  if (orderLabels.has(known)) return known;
+  const custom = /^tvdborder([1-9][0-9]{0,14})$/i.exec(value);
+  if (custom) return 'tvdbOrder' + custom[1];
+  throw new RequestError(404, 'Unknown TheTVDB episode order');
+}
+
+/** Returns navigable seasons in the requested order, or across orders for an exact keyed lookup. */
+function seriesSeasons(series, order) {
+  return (series.seasons || []).filter((season) => {
+    const id = seasonOrder(season);
+    return id && numericId(season.id) && coordinates(season.number) && (!order || order === id);
+  }).sort((a, b) => a.number - b.number);
+}
+
+/** Formats a show and advertises only the episode orders with season data for that show. */
 function showItem(series) {
+  const orders = new Map();
+  for (const row of seriesSeasons(series)) {
+    const id = seasonOrder(row);
+    if (orders.has(id)) continue;
+    const label = (id !== defaultOrder && row.type.alternateName) || orderLabels.get(id)
+      || row.type.name || 'Order ' + row.type.id;
+    orders.set(id, { id, source: 'tvdb', tag: label, title: `TheTVDB (${label})` });
+  }
+  const aired = orders.get(defaultOrder);
+  orders.delete(defaultOrder);
   return {
     ...describe('show', series, series.name, series.firstAired),
-    SeasonType: [{ id: 'official', source: 'tvdb', tag: 'Airing Order', title: 'TheTVDB (Aired)' }],
+    SeasonType: [...(aired ? [aired] : []), ...orders.values()],
   };
 }
 
-/** Formats a season and uses the earliest dated episode when its Aired entries are loaded. */
+/** Uses the declared season name or the Plex label for a numbered season or specials. */
+const seasonTitle = (season) => season.name || (season.number === 0 ? 'Specials' : `Season ${season.number}`);
+
+/** Formats a season using the earliest dated episode in its selected order. */
 function seasonItem(series, season, episodeRows = []) {
   const firstAired = episodeRows.map((episode) => episode.aired)
     .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date) && Number.isFinite(Date.parse(date))).sort()[0];
   return {
-    ...describe('season', season, season.name || (season.number === 0 ? 'Specials' : `Season ${season.number}`), firstAired),
-    ...ancestor('show', showItem(series), 'parent'),
+    ...describe('season', season, seasonTitle(season), firstAired),
+    ...ancestor('show', series.id, series.name, 'parent'),
     index: season.number,
   };
 }
 
 /** Formats an episode with its season number, ancestry, and runtime in milliseconds. */
 function episodeItem(series, season, episode) {
+  const alternateSeasonId = seasonOrder(season) === defaultOrder ? undefined : season.id;
   return {
-    ...describe('episode', episode, episode.name || `Episode ${episode.number}`, episode.aired),
-    ...ancestor('season', seasonItem(series, season), 'parent'),
-    ...ancestor('show', showItem(series), 'grandparent'),
+    ...describe('episode', episode, episode.name || `Episode ${episode.number}`, episode.aired, alternateSeasonId),
+    ...ancestor('season', season.id, seasonTitle(season), 'parent'),
+    ...ancestor('show', series.id, series.name, 'grandparent'),
     index: episode.number,
     parentIndex: season.number,
     ...(episode.runtime ? { duration: episode.runtime * 60000 } : {}),
@@ -167,53 +209,51 @@ export function createProvider(config) {
   /** Accepts either a JSON boolean or 1 for a Plex include flag. */
   const include = (value) => value === true || String(value) === '1';
 
-  /** Formats requested Aired seasons, retaining the series summary if a season record is missing. */
-  async function seasonItems(show, rows) {
-    return Promise.all(rows.map(async (row) => {
-      try {
-        return seasonItem(show, row, episodes(await season(row.id)));
-      } catch (error) {
-        if (!(error instanceof RequestError) || error.status !== 404) throw error;
-        return seasonItem(show, row);
-      }
-    }));
-  }
-
-  /** Rejects episode orders this provider does not implement. */
-  function requireAired(order) {
-    if (order && !['default', 'official', 'aired', 'tvdbAiring'].includes(order)) {
-      throw new RequestError(404, 'Only TVDB Aired ordering is available');
+  /** Returns episode members of a listed season, even if its cached listing outlives the record. */
+  async function seasonEpisodes(id) {
+    try {
+      return episodes(await season(id));
+    } catch (error) {
+      if (!(error instanceof RequestError) || error.status !== 404) throw error;
+      return [];
     }
   }
 
+  /** Formats requested seasons, retaining the series summary if a season record is missing. */
+  async function seasonItems(show, rows) {
+    return Promise.all(rows.map(async (row) => seasonItem(show, row, await seasonEpisodes(row.id))));
+  }
+
   /** Loads a known TheTVDB item and its Plex hierarchy. */
-  async function load(kind, id, language) {
+  async function load(kind, id, language, order, seasonId) {
     if (kind === 'show') {
       const s = await series(id, language);
-      return { item: showItem(s), children: airedSeasons(s), series: s };
+      return { item: showItem(s), children: seriesSeasons(s, order ?? defaultOrder), series: s };
     }
     if (kind === 'season') {
       const seasonData = await season(id);
       if (!numericId(seasonData.seriesId)) throw new RequestError(502, 'TVDB season has no series');
       const s = await series(seasonData.seriesId, language);
-      const row = airedSeasons(s).find((part) => String(part.id) === id);
-      if (!row) throw new RequestError(404, 'TVDB aired season not found');
+      const row = seriesSeasons(s, order).find((part) => String(part.id) === id);
+      if (!row) throw new RequestError(404, 'TVDB season not found in the requested order');
       const episodeRows = episodes(seasonData);
       return { item: seasonItem(s, row, episodeRows), children: episodeRows.map((e) => episodeItem(s, row, e)) };
     }
     const e = await tvdb(`/episodes/${id}/extended`);
     if (!numericId(e.seriesId) || String(e.id) !== id) throw new RequestError(502, 'TVDB returned an invalid episode');
     const s = await series(e.seriesId, language);
-    const seasons = airedSeasons(s);
-    // Direct episode coordinates belong to the show's default order. Verify its Aired membership and number.
-    const candidates = Array.isArray(e.seasons)
-      ? seasons.filter((row) => e.seasons.some((part) => String(part.id) === String(row.id)))
-      : seasons.sort((a, b) => (b.number === e.seasonNumber) - (a.number === e.seasonNumber));
+    // Use the episode coordinates from the selected season, since the extended record uses the series default.
+    const seasons = seasonId
+      ? seriesSeasons(s, order).filter((row) => String(row.id) === seasonId && seasonOrder(row) !== defaultOrder)
+      : seriesSeasons(s, order ?? defaultOrder);
+    const candidates = seasonId || !Array.isArray(e.seasons)
+      ? seasons.sort((a, b) => (b.number === e.seasonNumber) - (a.number === e.seasonNumber))
+      : seasons.filter((row) => e.seasons.some((part) => String(part.id) === String(row.id)));
     for (const row of candidates) {
-      const member = episodes(await season(row.id)).find((part) => String(part.id) === id && coordinates(part.number));
+      const member = (await seasonEpisodes(row.id)).find((part) => String(part.id) === id && coordinates(part.number));
       if (member) return { item: episodeItem(s, row, { ...e, number: member.number }), children: [] };
     }
-    throw new RequestError(404, 'TVDB episode is not in Aired order');
+    throw new RequestError(404, 'TVDB episode not found in the requested order');
   }
 
   /** Resolves the show by file ID first, then by title and year when no ID is present. */
@@ -271,11 +311,11 @@ export function createProvider(config) {
   async function match(body, language) {
     const kind = Number.isInteger(body.type) ? kinds[body.type] : undefined;
     if (!kind) throw new RequestError(400, 'Unsupported metadata type');
-    requireAired(body.episodeOrder);
+    const order = requestedOrder(body.episodeOrder ?? body.episodeOrdering);
     const external = typeof body.guid === 'string' ? body.guid.match(/^tvdb:\/\/([1-9][0-9]{0,14})$/)?.[1] : null;
     if (external) {
       try {
-        const { item, children, series: show } = await load(kind, external, language);
+        const { item, children, series: show } = await load(kind, external, language, order);
         return envelope([include(body.includeChildren) && kind !== 'episode'
           ? withChildren(item, show ? await seasonItems(show, children) : children) : item]);
       } catch (error) {
@@ -287,7 +327,7 @@ export function createProvider(config) {
     const name = { show: body.title, season: body.parentTitle, episode: body.grandparentTitle }[kind];
     const matches = [];
     for (const show of await findSeries(name, kind === 'show' ? body.year : null, manual, body.filename, language)) {
-      const seasons = airedSeasons(show);
+      const seasons = seriesSeasons(show, order ?? defaultOrder);
       if (kind === 'show') {
         const item = showItem(show);
         matches.push(include(body.includeChildren) ? withChildren(item, await seasonItems(show, seasons)) : item);
@@ -300,7 +340,7 @@ export function createProvider(config) {
           ? withChildren(item, episodeRows.map((e) => episodeItem(show, row, e))) : item);
       } else {
         for (const row of seasons.filter((item) => !coordinates(body.parentIndex) || item.number === body.parentIndex)) {
-          for (const episode of episodes(await season(row.id))) {
+          for (const episode of await seasonEpisodes(row.id)) {
             const exact = coordinates(body.parentIndex) && coordinates(body.index)
               ? episode.number === body.index : Boolean(body.date && episode.aired === body.date);
             if (exact) matches.push(episodeItem(show, row, episode));
@@ -336,24 +376,25 @@ export function createProvider(config) {
         body = tvdb.cacheCounts();
       } else if (request.method === 'GET' && url.pathname === '/') {
         body = { MediaProvider: {
-          identifier, title: 'TheTVDB Aired', version: '1.0.0',
+          identifier, title: 'TheTVDB', version: '1.0.0',
           Types: Object.keys(kinds).map((type) => ({ type: Number(type), Scheme: [{ scheme: identifier }] })),
           Feature: [{ type: 'metadata', key: metadataPath }, { type: 'match', key: metadataPath + '/matches' }],
         } };
       } else if (request.method === 'POST' && url.pathname === metadataPath + '/matches') {
         body = await match(await readBody(request), language);
       } else {
-        const parsed = url.pathname.match(/^\/library\/metadata\/(show|season|episode)-([1-9][0-9]{0,14})(?:\/(children|grandchildren|images))?$/);
+        const parsed = url.pathname.match(/^\/library\/metadata\/(show|season|episode)-([1-9][0-9]{0,14})(?:-([1-9][0-9]{0,14}))?(?:\/(children|grandchildren|images))?$/);
         if (request.method !== 'GET' || !parsed) throw new RequestError(404, 'Unknown endpoint');
-        requireAired(url.searchParams.get('episodeOrder') || url.searchParams.get('episodeOrdering'));
-        const [, kind, id, part] = parsed;
-        const { item, children, series: show } = await load(kind, id, language);
+        const order = requestedOrder(url.searchParams.get('episodeOrder') || url.searchParams.get('episodeOrdering'));
+        const [, kind, id, seasonId, part] = parsed;
+        if (seasonId && kind !== 'episode') throw new RequestError(404, 'Unknown endpoint');
+        const { item, children, series: show } = await load(kind, id, language, order, seasonId);
         if (part === 'children') {
           body = await page(request, url, children, show);
         } else if (part === 'grandchildren') {
           const rows = [];
           for (const row of show ? children : []) {
-            rows.push(...episodes(await season(row.id)).map((e) => episodeItem(show, row, e)));
+            rows.push(...(await seasonEpisodes(row.id)).map((e) => episodeItem(show, row, e)));
           }
           body = await page(request, url, rows);
         } else if (part === 'images') {

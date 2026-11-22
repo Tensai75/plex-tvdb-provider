@@ -1,6 +1,6 @@
 # Plex TVDB Provider
 
-A self-hosted [TheTVDB](https://thetvdb.com/) metadata provider for Plex TV libraries. It supplies show, season, and episode metadata and artwork using TheTVDB Aired episode order, including specials. Multiple Plex servers can use one instance and share a persistent SQLite cache. The provider coalesces concurrent requests for the same metadata and honors TheTVDB rate-limit responses.
+A self-hosted [TheTVDB](https://thetvdb.com/) metadata provider for Plex TV libraries. It supplies show, season, and episode metadata and artwork using TheTVDB episode orders, including specials. Multiple Plex servers can use one instance and share a persistent SQLite cache. The provider coalesces concurrent requests for the same metadata and honors TheTVDB rate-limit responses.
 
 ## Install with Docker Compose
 
@@ -35,15 +35,19 @@ With the cache disabled, the provider leaves the SQLite volume untouched and sti
 
 1. Open Plex Web as the server owner and select the correct server. Go to **Settings → Metadata Agents → Add Provider**.
 2. Enter `http://<docker-host-ip>:3000` and save. Use the Docker host's address as seen from **Plex Media Server**. If Plex runs in a container on the same Docker network, you can use the provider's service name and container port instead. Use the root URL, including any host port you changed.
-3. On the same settings page, select **Add Agent**, name it **TheTVDB Aired**, and select the **TheTVDB Aired** provider as its primary provider. Save the agent.
-4. Create a **TV Shows** library or open **Manage Library → Edit** on an existing one. Under **Advanced**, select **Plex TV Series** as the scanner and **TheTVDB Aired** as the agent. If Plex offers an episode-ordering selector, choose **TheTVDB (Aired)**. Save the library.
+3. On the same settings page, select **Add Agent**, name it **TheTVDB**, and select the **TheTVDB** provider as its primary provider. Save the agent.
+4. Create a **TV Shows** library or open **Manage Library → Edit** on an existing one. Under **Advanced**, select **Plex TV Series** as the scanner and **TheTVDB** as the agent. Save the library.
 5. Plex uses the selected agent for new items. To apply it to existing shows, use **Refresh Metadata** on a show or **Refresh All Metadata** in the library menu.
 
 Register the same provider URL on each Plex server that should use it. See [Plex's Custom Metadata Providers guide](https://forums.plex.tv/t/announcement-custom-metadata-providers/934384/) for the distinction between providers and agents.
 
+## Choose an episode order
+
+The provider defaults to **TheTVDB (Aired)**. To use a different order, open the show in Plex Web and select **Edit → Advanced → Episode ordering**. Plex lists the orders TheTVDB offers for that show, which can include **DVD**, **Absolute**, or named orders such as **Streaming Order**. Match the season and episode numbers in your filenames to the order you choose.
+
 ## How show matching works
 
-When Plex sends a media path with an IMDb ID, the provider looks it up in TheTVDB and uses it when it identifies exactly one series. A show folder can include `imdb-tt1234567`, `{imdb-tt1234567}`, `[imdb-tt1234567]`, or `(imdb-tt1234567)`. A `{tvdb-123456}` tag also works and takes precedence if both are present. When Plex sends no supported ID, the provider searches by show title or alias and uses the year when available. Keep episodes numbered according to TheTVDB Aired order.
+When Plex sends a media path with an IMDb ID, the provider looks it up in TheTVDB and uses it when it identifies exactly one series. A show folder can include `imdb-tt1234567`, `{imdb-tt1234567}`, `[imdb-tt1234567]`, or `(imdb-tt1234567)`. A `{tvdb-123456}` tag also works and takes precedence if both are present. When Plex sends no supported ID, the provider searches by show title or alias and uses the year when available.
 
 In **Sonarr → Settings → Media Management**, enable **Show Advanced**. This **Series Folder Format** adds the IMDb ID.
 
@@ -55,7 +59,6 @@ Keep the `imdb-` prefix. The outer braces are optional. [Sonarr supports the IMD
 
 ## Limits and troubleshooting
 
-- The provider supports TV shows with TheTVDB **Aired** episode order. DVD and alternate orders are outside its current scope.
 - Custom agents use their own Plex GUIDs. Plex's [cloud watch-state and ratings sync](https://support.plex.tv/articles/sync-watch-state-and-ratings/) requires the built-in Plex TV Series agent for TV libraries.
 - If Plex cannot add the provider, verify that the exact URL is reachable from the Plex server. The root URL should return a JSON object containing `MediaProvider`. If it registers but cannot fetch a show, run `docker compose logs plex-tvdb-provider` to check for TheTVDB authentication, connectivity, or rate-limit errors. `/health` checks that the local process is serving HTTP. `/stats` shows cached show and episode counts.
 

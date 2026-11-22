@@ -119,7 +119,8 @@ test('Plex discovery and TVDB matching, hierarchy, paging, misses and auth recov
   assert.deepEqual(nativeAired.MediaContainer.Metadata[0], show);
   const airedMatch = await match({ type: 2, title: 'Example', episodeOrder: 'tvdbAiring', includeChildren: 1 });
   assert.deepEqual(airedMatch.MediaContainer.Metadata[0], show);
-  await request(show.key + '?episodeOrder=tvdbAbsolute', {}, 404);
+  const unavailableOrder = await request(show.key + '?episodeOrder=tvdbAbsolute&includeChildren=1');
+  assert.deepEqual(unavailableOrder.MediaContainer.Metadata[0].Children.Metadata, []);
   const translatedShow = (await request(show.key + '?X-Plex-Language=fr-CA&includeChildren=1')).MediaContainer.Metadata[0];
   assert.equal(translatedShow.title, 'Exemple');
   assert.equal(translatedShow.originalTitle, 'Example');
@@ -178,8 +179,8 @@ test('Plex discovery and TVDB matching, hierarchy, paging, misses and auth recov
   assert.equal(children.totalSize, 3);
   assert.equal(children.Metadata[0].title, 'Pilot');
   assert.deepEqual(await request('/stats'), { cachedShows: 1, cachedEpisodes: 3 });
-  assert.equal((await request(show.key + '/children?episodeOrdering=dvd', {}, 404)).error,
-    'Only TVDB Aired ordering is available');
+  assert.equal((await request(show.key + '/children?episodeOrdering=tmdbAiring', {}, 404)).error,
+    'Unknown TheTVDB episode order');
   assert.equal((await match({ type: 2, title: 'Name', year: 2021 })).MediaContainer.size, 0);
 });
 
@@ -288,6 +289,104 @@ test('uses Aired episode membership and season dates, and checks localized title
   assert.equal(undated.year, undefined);
 });
 
+test('Plex uses one provider for Aired, DVD, Absolute and named episode orders', async (t) => {
+  const aired = { id: 30, seriesId: 1, number: 1, type: { id: 1, type: 'official' } };
+  const dvd = { id: 31, seriesId: 1, number: 1, type: { id: 2, type: 'dvd', alternateName: 'DVD Volumes' } };
+  const absolute = { id: 32, seriesId: 1, number: 1, type: { id: 3, type: 'absolute' } };
+  const streaming = { id: 33, seriesId: 1, number: 2, type: { id: 4, type: 'alternate', alternateName: 'Streaming Order' } };
+  const allOrders = [aired, dvd, absolute, streaming];
+  const data = { id: 1, name: 'Example', firstAired: '2021-01-01', defaultSeasonType: 2, seasons: allOrders };
+  const shared = { id: 21, seriesId: 1, name: 'Shared episode', aired: '2021-01-01', seasons: [aired, dvd, absolute] };
+  const recut = { id: 41, seriesId: 1, name: 'Streaming cut', aired: '2021-04-21', seasons: [streaming] };
+  const upstreamRoutes = {
+    '/login': { token: 'fixture-token' },
+    '/search': [{ tvdb_id: '1', name: 'Example', year: '2021' }],
+    '/series/1/extended': data,
+    '/seasons/30/extended': { ...aired, episodes: [{ ...shared, number: 1 }] },
+    '/seasons/31/extended': { ...dvd, episodes: [{ ...shared, number: 2 }] },
+    '/seasons/32/extended': { ...absolute, episodes: [{ ...shared, number: 11 }] },
+    '/seasons/33/extended': { ...streaming, episodes: [{ ...recut, number: 1 }] },
+    '/episodes/21/extended': { ...shared, seasonNumber: 1, number: 2 },
+    '/episodes/41/extended': { ...recut, seasonNumber: 1, number: 1 },
+  };
+  const upstream = createServer((request, response) => {
+    const { pathname } = new URL(request.url, 'http://localhost');
+    const value = upstreamRoutes[pathname];
+    if (!value) return response.writeHead(404).end();
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data: value }));
+  });
+  const baseUrl = await listen(upstream);
+  t.after(() => upstream.close());
+  const provider = createProvider({ api_key: 'fixture-key', baseUrl, spacingMs: 0 });
+  const base = await listen(provider);
+  t.after(() => provider.close());
+  const get = async (path, options, status = 200) => {
+    const response = await fetch(base + path, options);
+    assert.equal(response.status, status);
+    const body = await response.json();
+    return body.MediaContainer?.Metadata ?? body;
+  };
+  const match = (body) => get('/library/metadata/matches', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const showPath = '/library/metadata/show-1';
+  const discovery = (await get('/')).MediaProvider;
+  assert.equal(discovery.title, 'TheTVDB');
+  const [show] = await get(showPath + '?includeChildren=1');
+  assert.equal(show.ratingKey, 'show-1');
+  assert.deepEqual(show.SeasonType.map(({ id, title }) => [id, title]), [
+    ['official', 'TheTVDB (Aired)'], ['dvd', 'TheTVDB (DVD Volumes)'],
+    ['absolute', 'TheTVDB (Absolute)'], ['tvdbOrder4', 'TheTVDB (Streaming Order)'],
+  ]);
+  assert.equal(show.Children.Metadata[0].ratingKey, 'season-30');
+
+  const inOrder = [
+    ['official', aired, shared, 1],
+    ['tvdbDVD', dvd, shared, 2],
+    ['tvdbAbsolute', absolute, shared, 11],
+    ['tvdbOrder4', streaming, recut, 1],
+  ];
+  for (const [order, selected, episode, index] of inOrder) {
+    const seasonKey = 'season-' + selected.id;
+    const episodeKey = 'episode-' + episode.id + (selected === aired ? '' : '-' + selected.id);
+    const episodeGuid = discovery.identifier + '://episode/' + episodeKey;
+    const [datedSeason] = await get(showPath + '/children?episodeOrdering=' + order);
+    assert.equal(datedSeason.ratingKey, seasonKey);
+    assert.equal(datedSeason.originallyAvailableAt, episode.aired);
+    const [showMatch] = await match({ type: 2, guid: 'tvdb://1', episodeOrder: order, includeChildren: 1 });
+    assert.equal(showMatch.guid, show.guid);
+    assert.equal(showMatch.Children.Metadata[0].ratingKey, seasonKey);
+    const [seasonMatch] = await match({ type: 3, parentTitle: 'Example', index: selected.number,
+      episodeOrder: order, includeChildren: 1 });
+    assert.equal(seasonMatch.key, datedSeason.key);
+    assert.equal(seasonMatch.Children.Metadata[0].guid, episodeGuid);
+    // Plex can omit the order when it fetches a season or episode by key.
+    const [seasonDetails] = await get(datedSeason.key + '?includeChildren=1');
+    const [listedEpisode] = seasonDetails.Children.Metadata;
+    assert.equal(listedEpisode.guid, episodeGuid);
+    const [episodeDetails] = await get(listedEpisode.key);
+    assert.equal(episodeDetails.guid, episodeGuid);
+    assert.equal(episodeDetails.index, index);
+    assert.equal(episodeDetails.parentIndex, selected.number);
+    assert.deepEqual(episodeDetails.Guid, [{ id: 'tvdb://' + episode.id }]);
+    assert.equal((await get(showPath + '/grandchildren?episodeOrder=' + order))[0].guid, episodeGuid);
+    const [episodeMatch] = await match({ type: 4, grandparentTitle: 'Example', parentIndex: selected.number,
+      index, episodeOrder: order });
+    assert.equal(episodeMatch.guid, episodeGuid);
+    const [externalMatch] = await match({ type: 4, guid: 'tvdb://' + episode.id, episodeOrder: order });
+    assert.equal(externalMatch.guid, episodeGuid);
+  }
+
+  // The same cache must still resolve the original Aired coordinates after visiting the other orders.
+  const [airedAgain] = await get('/library/metadata/episode-21');
+  assert.equal(airedAgain.ratingKey, 'episode-21');
+  assert.equal(airedAgain.index, 1);
+  assert.deepEqual(await get(showPath + '/children?episodeOrder=tvdbOrder99'), []);
+  assert.deepEqual(await match({ type: 4, guid: 'tvdb://41', episodeOrder: 'official' }), []);
+  await get('/library/metadata/episode-41-31', undefined, 404);
+  await get('/library/metadata/episode-21-31?episodeOrder=official', undefined, 404);
+});
+
 test('a missing season does not hide a cached show or its dated siblings', async (t) => {
   let seriesFetches = 0;
   let missingSeasonStatus = 404;
@@ -340,6 +439,7 @@ test('a missing season does not hide a cached show or its dated siblings', async
   assert.equal(missingPage.totalSize, 2);
   assert.equal(missingPage.Metadata[0].ratingKey, 'season-12');
   assert.equal((await fetch(base + '/library/metadata/season-12')).status, 404);
+  assert.deepEqual((await get(showPath + '/grandchildren')).Metadata.map((row) => row.ratingKey), ['episode-200']);
 
   missingSeasonStatus = 500;
   assert.equal((await fetch(base + showPath + '?includeChildren=1')).status, 502);
