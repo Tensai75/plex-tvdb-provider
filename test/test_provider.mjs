@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import test from 'node:test';
 import { createProvider } from '../application/provider.mjs';
@@ -211,8 +212,10 @@ test('uses Aired episode membership and season dates, and checks localized title
     '/episodes/23/extended': { ...secondEpisode, seasonNumber: 2, number: 8 },
     '/episodes/25/extended': { ...dvdEpisode, id: 25, seasons: [dvdSeason, airedSeason] },
   };
+  const seasonFetches = [];
   const upstream = createServer((request, response) => {
     const url = new URL(request.url, 'http://localhost');
+    if (url.pathname.startsWith('/seasons/')) seasonFetches.push(url.pathname);
     const data = url.pathname === '/search' ? searches[url.searchParams.get('query')] : routes[url.pathname];
     if (!data) {
       response.writeHead(404).end();
@@ -239,6 +242,17 @@ test('uses Aired episode membership and season dates, and checks localized title
     return (await response.json()).MediaContainer.Metadata;
   };
 
+  const plainShow = await fetch(base + '/library/metadata/show-1');
+  assert.equal(plainShow.status, 200);
+  assert.deepEqual(seasonFetches, []);
+  const page = await fetch(base + '/library/metadata/show-1/children?X-Plex-Container-Size=1');
+  assert.equal(page.status, 200);
+  const listed = (await page.json()).MediaContainer;
+  assert.equal(listed.totalSize, 2);
+  assert.equal(listed.size, 1);
+  assert.equal(listed.Metadata[0].originallyAvailableAt, '2020-03-15');
+  assert.deepEqual(seasonFetches, ['/seasons/31/extended']);
+
   const episode = await read('episode', 21);
   assert.equal(episode.index, 1);
   assert.equal(episode.parentIndex, 1);
@@ -261,9 +275,43 @@ test('uses Aired episode membership and season dates, and checks localized title
   assert.equal(season.year, 2020);
   const [matchedSeason] = await match({ type: 3, parentTitle: 'Original', index: 1 });
   assert.equal(matchedSeason.originallyAvailableAt, season.originallyAvailableAt);
+  const showWithChildren = await read('show', 1);
+  const [titleMatch] = await match({ type: 2, title: 'Original', year: 2020, includeChildren: 1 });
+  const [guidMatch] = await match({ type: 2, guid: 'tvdb://1', includeChildren: 1 });
+  for (const show of [showWithChildren, titleMatch, guidMatch]) {
+    assert.equal(show.Children.size, 2);
+    assert.equal(show.Children.Metadata[0].originallyAvailableAt, season.originallyAvailableAt);
+    assert.equal(show.Children.Metadata[1].originallyAvailableAt, undefined);
+  }
   const undated = await read('season', 32);
   assert.equal(undated.originallyAvailableAt, undefined);
   assert.equal(undated.year, undefined);
+});
+
+test('custom provider identifiers preserve case and reject disallowed characters', () => {
+  const source = new URL('../application/provider.mjs', import.meta.url).href;
+  const command = `
+    import { createProvider } from ${JSON.stringify(source)};
+    const server = createProvider({ api_key: 'fixture-key', cacheTtlMs: 0 });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const response = await fetch('http://127.0.0.1:' + server.address().port + '/');
+    console.log(JSON.stringify((await response.json()).MediaProvider));
+    server.close();
+  `;
+  const run = (identifier) => spawnSync(process.execPath, ['--input-type=module', '-e', command], {
+    env: { ...process.env, PLEX_PROVIDER_IDENTIFIER: identifier }, encoding: 'utf8', timeout: 5000,
+  });
+
+  const identifier = 'tv.plex.agents.custom.Review.Legacy';
+  const accepted = run(identifier);
+  assert.equal(accepted.status, 0, accepted.stderr);
+  const discovery = JSON.parse(accepted.stdout);
+  assert.equal(discovery.identifier, identifier);
+  assert.ok(discovery.Types.every(({ Scheme }) => Scheme[0].scheme === identifier));
+
+  const rejected = run('tv.plex.agents.custom.review-legacy');
+  assert.equal(rejected.status, 1, rejected.stderr);
+  assert.match(rejected.stderr, /PLEX_PROVIDER_IDENTIFIER must be a valid Plex custom provider identifier/);
 });
 
 test('cache coalescing, persistence, default and configured expiration, and disabling', async (t) => {

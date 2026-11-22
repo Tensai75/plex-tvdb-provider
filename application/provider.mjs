@@ -2,8 +2,8 @@ import { createServer } from 'node:http';
 import { RequestError, tvdbClient } from './tvdb.mjs';
 
 // Existing installations can retain their Plex GUID namespace when adopting this image.
-const identifier = process.env.PLEX_PROVIDER_IDENTIFIER?.trim() || 'tv.plex.agents.custom.plextvdbprovider.tvdb';
-if (!/^tv\.plex\.agents\.custom\.[a-z0-9]+(?:[.-][a-z0-9]+)*$/.test(identifier)) {
+const identifier = process.env.PLEX_PROVIDER_IDENTIFIER || 'tv.plex.agents.custom.plextvdbprovider.tvdb';
+if (!/^tv\.plex\.agents\.custom\.[a-zA-Z0-9.]+$/.test(identifier)) {
   throw new Error('PLEX_PROVIDER_IDENTIFIER must be a valid Plex custom provider identifier');
 }
 const metadataPath = '/library/metadata';
@@ -167,6 +167,11 @@ export function createProvider(config) {
   /** Accepts either a JSON boolean or 1 for a Plex include flag. */
   const include = (value) => value === true || String(value) === '1';
 
+  /** Formats only the requested Aired seasons using their earliest known episode dates. */
+  async function seasonItems(show, rows) {
+    return Promise.all(rows.map(async (row) => seasonItem(show, row, episodes(await season(row.id)))));
+  }
+
   /** Rejects episode orders this provider does not implement. */
   function requireAired(order) {
     if (order && !['default', 'official', 'aired', 'tvdbAiring'].includes(order)) {
@@ -178,7 +183,7 @@ export function createProvider(config) {
   async function load(kind, id, language) {
     if (kind === 'show') {
       const s = await series(id, language);
-      return { item: showItem(s), children: airedSeasons(s).map((row) => seasonItem(s, row)), series: s };
+      return { item: showItem(s), children: airedSeasons(s), series: s };
     }
     if (kind === 'season') {
       const seasonData = await season(id);
@@ -263,9 +268,9 @@ export function createProvider(config) {
     const external = typeof body.guid === 'string' ? body.guid.match(/^tvdb:\/\/([1-9][0-9]{0,14})$/)?.[1] : null;
     if (external) {
       try {
-        const found = await load(kind, external, language);
+        const { item, children, series: show } = await load(kind, external, language);
         return envelope([include(body.includeChildren) && kind !== 'episode'
-          ? withChildren(found.item, found.children) : found.item]);
+          ? withChildren(item, show ? await seasonItems(show, children) : children) : item]);
       } catch (error) {
         if (error instanceof RequestError && error.status === 404) return envelope([]);
         throw error;
@@ -278,7 +283,7 @@ export function createProvider(config) {
       const seasons = airedSeasons(show);
       if (kind === 'show') {
         const item = showItem(show);
-        matches.push(include(body.includeChildren) ? withChildren(item, seasons.map((s) => seasonItem(show, s))) : item);
+        matches.push(include(body.includeChildren) ? withChildren(item, await seasonItems(show, seasons)) : item);
       } else if (kind === 'season') {
         const row = seasons.find((item) => item.number === body.index);
         if (!row) continue;
@@ -300,12 +305,13 @@ export function createProvider(config) {
   }
 
   /** Applies Plex’s header or query-string paging parameters to a result list. */
-  function page(request, url, rows) {
+  async function page(request, url, rows, show) {
     const param = (key) => url.searchParams.get(key) ?? request.headers[key.toLowerCase()];
     const start = Number(param('X-Plex-Container-Start') ?? 0);
     const size = Number(param('X-Plex-Container-Size') ?? 20);
     if (!coordinates(start) || !coordinates(size)) throw new RequestError(400, 'Invalid paging parameters');
-    return envelope(rows.slice(start, start + size), start, rows.length);
+    const selected = rows.slice(start, start + size);
+    return envelope(show ? await seasonItems(show, selected) : selected, start, rows.length);
   }
 
   /** Routes Plex discovery, matching, and metadata requests and formats errors. */
@@ -336,19 +342,19 @@ export function createProvider(config) {
         const [, kind, id, part] = parsed;
         const { item, children, series: show } = await load(kind, id, language);
         if (part === 'children') {
-          body = page(request, url, children);
+          body = await page(request, url, children, show);
         } else if (part === 'grandchildren') {
           const rows = [];
-          for (const row of show ? airedSeasons(show) : []) {
+          for (const row of show ? children : []) {
             rows.push(...episodes(await season(row.id)).map((e) => episodeItem(show, row, e)));
           }
-          body = page(request, url, rows);
+          body = await page(request, url, rows);
         } else if (part === 'images') {
           const images = item.Image || [];
           body = { MediaContainer: { identifier, offset: 0, size: images.length, totalSize: images.length, Image: images } };
         } else {
           body = envelope([include(url.searchParams.get('includeChildren')) && kind !== 'episode'
-            ? withChildren(item, children) : item]);
+            ? withChildren(item, show ? await seasonItems(show, children) : children) : item]);
         }
       }
     } catch (error) {
