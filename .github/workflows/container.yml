@@ -29,7 +29,7 @@ jobs:
       - name: Start the Compose example with a fresh volume
         run: |
           docker compose up -d --pull never --wait --wait-timeout 60
-          curl -fsS http://127.0.0.1:3000/ | jq -e '.MediaProvider.identifier == "tv.plex.agents.custom.marciocm.tvdb"'
+          curl -fsS http://127.0.0.1:3000/ | jq -e '.MediaProvider.identifier == "tv.plex.agents.custom.plextvdbprovider.tvdb"'
           curl -fsS http://127.0.0.1:3000/stats | jq -e '.cachedShows == 0 and .cachedEpisodes == 0'
       - name: Stop the test container
         if: always()

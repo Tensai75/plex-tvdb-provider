@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { RequestError, tvdbClient } from './tvdb.mjs';
 
-const identifier = 'tv.plex.agents.custom.marciocm.tvdb';
+const identifier = 'tv.plex.agents.custom.plextvdbprovider.tvdb';
 const metadataPath = '/library/metadata';
 const kinds = { 2: 'show', 3: 'season', 4: 'episode' };
 
