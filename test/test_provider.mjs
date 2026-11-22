@@ -537,6 +537,28 @@ test('show requests keep available orders and load requested seasons before opti
       assert.deepEqual(seasonRequests, ['/seasons/12/extended', '/seasons/31/extended']);
     });
   }
+
+  await t.test('manual title match loads all candidates before checking alternate orders', async (testCase) => {
+    const secondAired = {
+      ...aired, id: 22, seriesId: 2,
+      episodes: [{ ...aired.episodes[0], id: 301, seriesId: 2, aired: '2022-01-01' }],
+    };
+    routes['/search'].push({ tvdb_id: '2', name: 'Example', year: '2022' });
+    routes['/series/2/extended'] = { ...series, id: 2, firstAired: '2022-01-01', seasons: [secondAired] };
+    routes['/seasons/22/extended'] = secondAired;
+    seasonQuota = 2;
+    seasonRequests.length = 0;
+    const base = await start(testCase);
+    const response = await match(base, { title: 'Example', manual: 1 }, 1);
+    assert.equal(response.status, 200);
+    const { Metadata } = (await response.json()).MediaContainer;
+    assert.deepEqual(Metadata.map((show) => [show.ratingKey, show.Children.Metadata[0].ratingKey,
+      show.Children.Metadata[0].originallyAvailableAt]), [
+      ['show-1', 'season-12', '2021-01-01'],
+      ['show-2', 'season-22', '2022-01-01'],
+    ]);
+    assert.deepEqual(seasonRequests, ['/seasons/12/extended', '/seasons/22/extended', '/seasons/31/extended']);
+  });
 });
 
 test('custom provider identifiers preserve case and reject disallowed characters', () => {

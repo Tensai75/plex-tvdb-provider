@@ -243,13 +243,19 @@ export function createProvider(config) {
     return Promise.all(rows.map(async (row) => seasonItem(show, row, await seasonEpisodes(row.id))));
   }
 
-  /** Loads requested children before checking which optional orders Plex can offer. */
-  async function itemResult({ item, children, series: show }, includeChildren) {
-    const childItems = includeChildren && item.type !== 'episode'
-      ? (show ? await seasonItems(show, children) : children)
-      : undefined;
-    const result = show ? await showMetadata(show, item) : item;
-    return childItems ? withChildren(result, childItems) : result;
+  /** Loads requested children for every result before checking optional orders. */
+  async function itemResults(items, includeChildren) {
+    const results = [];
+    for (const { item, children, series: show } of items) {
+      const childItems = includeChildren && item.type !== 'episode'
+        ? (show ? await seasonItems(show, children) : children)
+        : undefined;
+      results.push(childItems ? withChildren(item, childItems) : item);
+    }
+    for (const [index, { series: show }] of items.entries()) {
+      if (show) results[index] = await showMetadata(show, results[index]);
+    }
+    return results;
   }
 
   /** Loads a known TheTVDB item and its Plex hierarchy. */
@@ -344,7 +350,7 @@ export function createProvider(config) {
     if (external) {
       try {
         const loaded = await load(kind, external, language, order);
-        return envelope([await itemResult(loaded, include(body.includeChildren))]);
+        return envelope(await itemResults([loaded], include(body.includeChildren)));
       } catch (error) {
         if (error instanceof RequestError && error.status === 404) return envelope([]);
         throw error;
@@ -352,13 +358,17 @@ export function createProvider(config) {
     }
     const manual = include(body.manual);
     const name = { show: body.title, season: body.parentTitle, episode: body.grandparentTitle }[kind];
+    const shows = await findSeries(name, kind === 'show' ? body.year : null, manual, body.filename, language);
+    if (kind === 'show') {
+      const items = shows.map((show) => ({
+        item: showItem(show), children: seriesSeasons(show, order ?? defaultOrder), series: show,
+      }));
+      return envelope(await itemResults(items, include(body.includeChildren)));
+    }
     const matches = [];
-    for (const show of await findSeries(name, kind === 'show' ? body.year : null, manual, body.filename, language)) {
+    for (const show of shows) {
       const seasons = seriesSeasons(show, order ?? defaultOrder);
-      if (kind === 'show') {
-        const loaded = { item: showItem(show), children: seasons, series: show };
-        matches.push(await itemResult(loaded, include(body.includeChildren)));
-      } else if (kind === 'season') {
+      if (kind === 'season') {
         const row = seasons.find((item) => item.number === body.index);
         if (!row) continue;
         const episodeRows = episodes(await season(row.id));
@@ -432,7 +442,7 @@ export function createProvider(config) {
           const images = item.Image || [];
           body = { MediaContainer: { identifier, offset: 0, size: images.length, totalSize: images.length, Image: images } };
         } else {
-          body = envelope([await itemResult(loaded, include(url.searchParams.get('includeChildren')))]);
+          body = envelope(await itemResults([loaded], include(url.searchParams.get('includeChildren'))));
         }
       }
     } catch (error) {
