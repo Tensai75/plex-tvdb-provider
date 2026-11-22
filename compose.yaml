@@ -1,0 +1,16 @@
+services:
+  plex-tvdb-provider:
+    image: ghcr.io/marciocm/plex-tvdb-provider:v0.1.0
+    ports:
+      - "${PLEX_TVDB_PORT:-3000}:3000"
+    environment:
+      TVDB_API_KEY: ${TVDB_API_KEY:?Set TVDB_API_KEY in .env}
+      TVDB_PIN: ${TVDB_PIN:-}
+      PLEX_PROVIDER_IDENTIFIER: "${PLEX_PROVIDER_IDENTIFIER:-}"
+      TVDB_CACHE_TTL_HOURS: "${TVDB_CACHE_TTL_HOURS:-24}"
+    volumes:
+      - tvdb-cache:/data
+    restart: unless-stopped
+
+volumes:
+  tvdb-cache:

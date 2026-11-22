@@ -1,0 +1,143 @@
+import { DatabaseSync } from 'node:sqlite';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+/** Carries an HTTP status and optional retry delay for the Plex response. */
+export class RequestError extends Error {
+  constructor(status, message, retryAfter) {
+    super(message);
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+}
+
+/**
+ * Creates an authenticated TheTVDB client with request pacing and an optional SQLite cache.
+ * Metadata age is measured from the upstream fetch. A zero cacheTtlMs bypasses SQLite.
+ */
+export function tvdbClient({
+  api_key, pin, cachePath = ':memory:', baseUrl = 'https://api4.thetvdb.com/v4',
+  cacheTtlMs = DAY_MS, now = Date.now, spacingMs = 250,
+}) {
+  const db = cacheTtlMs > 0 ? new DatabaseSync(cachePath) : undefined;
+  db?.exec(`
+    CREATE TABLE IF NOT EXISTS metadata_responses (
+      path TEXT PRIMARY KEY,
+      fetched_at INTEGER NOT NULL,
+      payload TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS metadata_response_age ON metadata_responses (fetched_at);
+  `);
+  const read = db?.prepare('SELECT payload FROM metadata_responses WHERE path = ? AND fetched_at > ?');
+  const write = db?.prepare(`
+    INSERT INTO metadata_responses (path, fetched_at, payload) VALUES (?, ?, ?)
+    ON CONFLICT (path) DO UPDATE SET fetched_at = excluded.fetched_at, payload = excluded.payload
+  `);
+  const expire = db?.prepare('DELETE FROM metadata_responses WHERE fetched_at <= ?');
+  const cacheCounts = db?.prepare(`
+    WITH fresh AS (SELECT path, payload FROM metadata_responses WHERE fetched_at > ?),
+    episode_ids AS (
+      SELECT json_extract(payload, '$.id') AS id
+      FROM fresh WHERE path GLOB '/episodes/[0-9]*/extended'
+      UNION
+      SELECT json_extract(episode.value, '$.id') AS id
+      FROM fresh, json_each(fresh.payload, '$.episodes') AS episode
+      WHERE fresh.path GLOB '/seasons/[0-9]*/extended'
+    )
+    SELECT
+      (SELECT COUNT(*) FROM fresh WHERE path GLOB '/series/[0-9]*/extended') AS cachedShows,
+      (SELECT COUNT(id) FROM episode_ids) AS cachedEpisodes
+  `);
+  const inFlight = new Map();
+  let nextPrune = 0;
+  let authorization;
+  let tokenExpires = 0;
+  let login;
+  let nextStart = Promise.resolve();
+  let backoffUntil = 0;
+
+  /** Spaces upstream requests and observes any active rate-limit delay. */
+  async function request(path, options) {
+    const scheduled = nextStart;
+    nextStart = scheduled.then(() => sleep(spacingMs));
+    await scheduled;
+    const remaining = () => Math.max(1, Math.ceil((backoffUntil - now()) / 1000));
+    if (backoffUntil > now()) {
+      throw new RequestError(503, 'TVDB rate limit reached', remaining());
+    }
+    const response = await fetch(baseUrl + path, {
+      ...options, redirect: 'error', signal: AbortSignal.timeout(12000),
+    });
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('retry-after');
+      const seconds = retryAfter && /^\d+$/.test(retryAfter)
+        ? Number(retryAfter) : (Date.parse(retryAfter) - now()) / 1000;
+      backoffUntil = Math.max(backoffUntil, now() + 1000 * Math.max(1, Math.min(3600,
+        Number.isFinite(seconds) ? seconds : 30)));
+      throw new RequestError(503, 'TVDB rate limit reached', remaining());
+    }
+    return response;
+  }
+
+  /** Reuses the login token and shares a single login among concurrent callers. */
+  async function token() {
+    if (authorization && now() < tokenExpires) return authorization;
+    login ??= (async () => {
+      const response = await request('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apikey: api_key, ...(pin ? { pin } : {}) }),
+      });
+      if (!response.ok) throw new RequestError(502, `TVDB authentication returned HTTP ${response.status}`);
+      const value = (await response.json()).data?.token;
+      if (typeof value !== 'string' || !value) {
+        throw new RequestError(502, 'TVDB authentication returned no token');
+      }
+      authorization = value;
+      tokenExpires = now() + DAY_MS;
+      return value;
+    })().finally(() => { login = undefined; });
+    return login;
+  }
+
+  /** Fetches metadata, retries once on an expired login, and caches successful responses. */
+  async function fetchMetadata(path) {
+    let used = await token();
+    let response = await request(path, { headers: { Authorization: 'Bearer ' + used } });
+    if (response.status === 401) {
+      if (authorization === used) authorization = undefined;
+      used = await token();
+      response = await request(path, { headers: { Authorization: 'Bearer ' + used } });
+    }
+    if (response.status === 404) throw new RequestError(404, 'TVDB item not found');
+    if (!response.ok) throw new RequestError(502, `TVDB metadata returned HTTP ${response.status}`);
+    const data = (await response.json()).data;
+    if (!data || typeof data !== 'object') throw new RequestError(502, 'TVDB returned an invalid result');
+    if (db) {
+      const fetchedAt = now();
+      if (fetchedAt >= nextPrune) {
+        expire.run(fetchedAt - cacheTtlMs);
+        nextPrune = fetchedAt + HOUR_MS;
+      }
+      write.run(path, fetchedAt, JSON.stringify(data));
+    }
+    return data;
+  }
+
+  /** Returns fresh cached metadata or shares an upstream fetch already in progress. */
+  async function get(path) {
+    const cached = read?.get(path, now() - cacheTtlMs);
+    if (cached) return JSON.parse(cached.payload);
+    if (!inFlight.has(path)) {
+      inFlight.set(path, fetchMetadata(path).finally(() => inFlight.delete(path)));
+    }
+    return inFlight.get(path);
+  }
+  /** Releases the SQLite connection when the provider closes. */
+  get.close = () => db?.close();
+  /** Counts unexpired items without contacting TheTVDB. */
+  get.cacheCounts = () => cacheCounts?.get(now() - cacheTtlMs) ?? { cachedShows: 0, cachedEpisodes: 0 };
+  return get;
+}
