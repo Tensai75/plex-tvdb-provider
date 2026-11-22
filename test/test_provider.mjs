@@ -147,8 +147,17 @@ test('Plex discovery and TVDB matching, hierarchy, paging, misses and auth recov
   assert.equal((await match({ type: 4, guid: 'tvdb://999' })).MediaContainer.size, 0);
 
   const filename = 'Different title {imdb-tt0123456}/Season 01/S01E01 - Pilot.mkv';
-  const taggedShow = (await match({ type: 2, title: 'Different title', filename })).MediaContainer.Metadata[0];
-  assert.equal(taggedShow.guid, show.guid);
+  for (const tag of ['{imdb-tt0123456}', '[imdb-tt0123456]', '(imdb-tt0123456)', 'IMDB-TT0123456']) {
+    const response = await match({ type: 2, title: 'Different title', filename: `Different title ${tag}/Season 01/Pilot.mkv` });
+    assert.equal(response.MediaContainer.Metadata[0]?.guid, show.guid, tag);
+  }
+  for (const tag of ['ximdb-tt0123456', 'imdb-tt0123456x', 'imdb-tt0123456789012345']) {
+    const filename = `Example ${tag}/Season 01/Pilot.mkv`;
+    const wrongTitle = await match({ type: 2, title: 'Different title', filename });
+    assert.equal(wrongTitle.MediaContainer.size, 0, tag);
+    const byTitle = await match({ type: 2, title: 'Example', year: 2021, filename });
+    assert.equal(byTitle.MediaContainer.Metadata[0]?.guid, show.guid, tag);
+  }
   const taggedSeason = (await match({ type: 3, parentTitle: 'Different title', index: 1,
     filename, includeChildren: 1 })).MediaContainer.Metadata[0];
   assert.equal(taggedSeason.index, 1);

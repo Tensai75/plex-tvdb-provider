@@ -172,7 +172,7 @@ export function createProvider(config) {
     const path = typeof file === 'string' ? file : '';
     const namedId = path.match(/\{tvdb-([1-9][0-9]{0,14})\}/i)?.[1];
     if (namedId) return [await series(namedId, language)];
-    const imdbId = path.match(/\{imdb-(tt[0-9]{1,15})\}/i)?.[1].toLowerCase();
+    const imdbId = path.match(/(?<![\p{L}\p{N}])imdb-(tt[0-9]{1,15})(?![\p{L}\p{N}])/iu)?.[1].toLowerCase();
     if (imdbId) {
       let results;
       try {

@@ -37,7 +37,7 @@ Register the same provider URL on each Plex server that should use it. See [Plex
 
 ## How show matching works
 
-When Plex sends a media path containing an IMDb ID in braces, such as `Show Name (2020) {imdb-tt1234567}/`, the provider looks up that IMDb ID in TheTVDB and uses it when it identifies exactly one series. A `{tvdb-123456}` tag also works and takes precedence if both are present. When Plex sends no supported ID, the provider searches by show title or alias and uses the year when available. Keep episodes numbered according to TheTVDB Aired order.
+When Plex sends a media path with an IMDb ID, the provider looks it up in TheTVDB and uses it when it identifies exactly one series. A show folder can include `imdb-tt1234567`, `{imdb-tt1234567}`, `[imdb-tt1234567]`, or `(imdb-tt1234567)`. A `{tvdb-123456}` tag also works and takes precedence if both are present. When Plex sends no supported ID, the provider searches by show title or alias and uses the year when available. Keep episodes numbered according to TheTVDB Aired order.
 
 In **Sonarr → Settings → Media Management**, enable **Show Advanced**. This **Series Folder Format** adds the IMDb ID.
 
@@ -45,7 +45,7 @@ In **Sonarr → Settings → Media Management**, enable **Show Advanced**. This 
 {Series CleanTitleWithoutYear} ({Series Year}) {imdb-{ImdbId}}
 ```
 
-Keep the outer braces and the `imdb-` prefix. [Sonarr supports the IMDb token for series folders](https://wiki.servarr.com/sonarr/settings#series-folder-format). [Radarr also supports IMDb IDs in movie folder names](https://wiki.servarr.com/radarr/settings#movie-folder-format). This provider serves TV libraries.
+Keep the `imdb-` prefix. The outer braces are optional. [Sonarr supports the IMDb token for series folders](https://wiki.servarr.com/sonarr/settings#series-folder-format). [Radarr also supports IMDb IDs in movie folder names](https://wiki.servarr.com/radarr/settings#movie-folder-format). This provider serves TV libraries.
 
 ## Limits and troubleshooting
 
