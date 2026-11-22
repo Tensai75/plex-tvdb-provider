@@ -1,7 +1,11 @@
 import { createServer } from 'node:http';
 import { RequestError, tvdbClient } from './tvdb.mjs';
 
-const identifier = 'tv.plex.agents.custom.plextvdbprovider.tvdb';
+// Existing installations can retain their Plex GUID namespace when adopting this image.
+const identifier = process.env.PLEX_PROVIDER_IDENTIFIER?.trim() || 'tv.plex.agents.custom.plextvdbprovider.tvdb';
+if (!/^tv\.plex\.agents\.custom\.[a-z0-9]+(?:[.-][a-z0-9]+)*$/.test(identifier)) {
+  throw new Error('PLEX_PROVIDER_IDENTIFIER must be a valid Plex custom provider identifier');
+}
 const metadataPath = '/library/metadata';
 const kinds = { 2: 'show', 3: 'season', 4: 'episode' };
 
@@ -47,8 +51,7 @@ function describe(type, record, title, date) {
   const ratingKey = itemKey(type, record.id);
   return {
     ratingKey, key: `${metadataPath}/${ratingKey}`, guid: guid(type, record.id), type, title,
-    originallyAvailableAt: date || '',
-    ...(date ? { year: Number(date.slice(0, 4)) } : {}),
+    ...(date ? { originallyAvailableAt: date, year: Number(date.slice(0, 4)) } : {}),
     ...(record.originalTitle ? { originalTitle: record.originalTitle } : {}),
     summary: [record.overview, 'Metadata provided by TheTVDB\nhttps://thetvdb.com/'].filter(Boolean).join('\n\n'),
     ...(record.image ? {
@@ -78,7 +81,7 @@ function envelope(items, offset = 0, totalSize = items.length) {
 /** Selects the official airing-order seasons, including season zero for specials. */
 function airedSeasons(series) {
   return (series.seasons || []).filter((season) =>
-    numericId(season.id) && coordinates(season.number) && ['official', 'default'].includes(season.type?.type)
+    numericId(season.id) && coordinates(season.number) && season.type?.type === 'official'
   ).sort((a, b) => a.number - b.number);
 }
 
@@ -90,10 +93,12 @@ function showItem(series) {
   };
 }
 
-/** Formats a season with its number and parent show. */
-function seasonItem(series, season) {
+/** Formats a season and uses the earliest dated episode when its Aired entries are loaded. */
+function seasonItem(series, season, episodeRows = []) {
+  const firstAired = episodeRows.map((episode) => episode.aired)
+    .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date) && Number.isFinite(Date.parse(date))).sort()[0];
   return {
-    ...describe('season', season, season.name || (season.number === 0 ? 'Specials' : `Season ${season.number}`), ''),
+    ...describe('season', season, season.name || (season.number === 0 ? 'Specials' : `Season ${season.number}`), firstAired),
     ...ancestor('show', showItem(series), 'parent'),
     index: season.number,
   };
@@ -181,14 +186,22 @@ export function createProvider(config) {
       const s = await series(seasonData.seriesId, language);
       const row = airedSeasons(s).find((part) => String(part.id) === id);
       if (!row) throw new RequestError(404, 'TVDB aired season not found');
-      return { item: seasonItem(s, row), children: episodes(seasonData).map((e) => episodeItem(s, row, e)) };
+      const episodeRows = episodes(seasonData);
+      return { item: seasonItem(s, row, episodeRows), children: episodeRows.map((e) => episodeItem(s, row, e)) };
     }
     const e = await tvdb(`/episodes/${id}/extended`);
-    if (!numericId(e.seriesId)) throw new RequestError(502, 'TVDB episode has no series');
+    if (!numericId(e.seriesId) || String(e.id) !== id) throw new RequestError(502, 'TVDB returned an invalid episode');
     const s = await series(e.seriesId, language);
-    const row = airedSeasons(s).find((part) => part.number === e.seasonNumber);
-    if (!row) throw new RequestError(404, 'TVDB aired episode not found');
-    return { item: episodeItem(s, row, e), children: [] };
+    const seasons = airedSeasons(s);
+    // Direct episode coordinates belong to the show's default order. Verify its Aired membership and number.
+    const candidates = Array.isArray(e.seasons)
+      ? seasons.filter((row) => e.seasons.some((part) => String(part.id) === String(row.id)))
+      : seasons.sort((a, b) => (b.number === e.seasonNumber) - (a.number === e.seasonNumber));
+    for (const row of candidates) {
+      const member = episodes(await season(row.id)).find((part) => String(part.id) === id && coordinates(part.number));
+      if (member) return { item: episodeItem(s, row, { ...e, number: member.number }), children: [] };
+    }
+    throw new RequestError(404, 'TVDB episode is not in Aired order');
   }
 
   /** Resolves the show by file ID first, then by title and year when no ID is present. */
@@ -220,11 +233,23 @@ export function createProvider(config) {
     const matching = new Map();
     for (const row of results) {
       if (!numericId(row.tvdb_id)) continue;
-      if (![row.name, ...(row.aliases || [])].some((name) => normalize(name) === wanted)) continue;
+      const translations = typeof row.translations === 'object' ? Object.values(row.translations || {}) : [];
+      if (![row.name, ...(row.aliases || []), ...translations]
+        .some((name) => typeof name === 'string' && normalize(name) === wanted)) continue;
       if (year && row.year && String(year) !== String(row.year)) continue;
       matching.set(String(row.tvdb_id), row);
     }
-    if (!manual && matching.size !== 1) return [];
+    if (!manual) {
+      let chosen;
+      for (const [id, row] of matching) {
+        const record = year && !row.year ? await series(id, language) : undefined;
+        const premiereYear = record?.firstAired?.slice(0, 4) || record?.year;
+        if (premiereYear && String(premiereYear) !== String(year)) continue;
+        if (chosen) return [];
+        chosen = { id, record };
+      }
+      return chosen ? [chosen.record ?? await series(chosen.id, language)] : [];
+    }
     const picks = matching.size ? matching.keys() : results
       .filter((row) => numericId(row.tvdb_id)).map((row) => String(row.tvdb_id));
     return Promise.all([...new Set(picks)].slice(0, 8).map((id) => series(id, language)));
@@ -257,9 +282,10 @@ export function createProvider(config) {
       } else if (kind === 'season') {
         const row = seasons.find((item) => item.number === body.index);
         if (!row) continue;
-        const item = seasonItem(show, row);
-        const children = include(body.includeChildren) ? episodes(await season(row.id)).map((e) => episodeItem(show, row, e)) : null;
-        matches.push(children ? withChildren(item, children) : item);
+        const episodeRows = episodes(await season(row.id));
+        const item = seasonItem(show, row, episodeRows);
+        matches.push(include(body.includeChildren)
+          ? withChildren(item, episodeRows.map((e) => episodeItem(show, row, e))) : item);
       } else {
         for (const row of seasons.filter((item) => !coordinates(body.parentIndex) || item.number === body.parentIndex)) {
           for (const episode of episodes(await season(row.id))) {

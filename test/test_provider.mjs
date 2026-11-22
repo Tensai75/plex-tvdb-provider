@@ -182,6 +182,90 @@ test('Plex discovery and TVDB matching, hierarchy, paging, misses and auth recov
   assert.equal((await match({ type: 2, title: 'Name', year: 2021 })).MediaContainer.size, 0);
 });
 
+test('uses Aired episode membership and season dates, and checks localized titles and premiere years', async (t) => {
+  const airedSeason = { id: 31, seriesId: 1, number: 1, type: { type: 'official' } };
+  const undatedSeason = { id: 32, seriesId: 1, number: 2, type: { type: 'official' } };
+  const dvdSeason = { id: 39, seriesId: 1, number: 1, type: { type: 'dvd' } };
+  const firstEpisode = { id: 21, seriesId: 1, seasonNumber: 1, number: 1, aired: '2020-04-01' };
+  const secondEpisode = { id: 23, seriesId: 1, seasonNumber: 1, number: 2, aired: '2020-03-15' };
+  const dvdEpisode = { id: 22, seriesId: 1, seasonNumber: 1, number: 1, seasons: [dvdSeason] };
+  const original = { id: 1, name: 'Original', firstAired: '2020-03-15', defaultSeasonType: 2,
+    seasons: [dvdSeason, airedSeason, undatedSeason] };
+  const remake = { id: 2, name: 'Original', firstAired: '2024-06-01', seasons: [] };
+  const originalHit = { tvdb_id: '1', name: 'Original', translations: { fra: 'Titre français' } };
+  const remakeHit = { tvdb_id: '2', name: 'Original', year: '2024', aliases: ['Reboot'],
+    translations: { fra: 'Titre français' } };
+  const searches = {
+    Original: [originalHit],
+    Reboot: [{ ...originalHit, aliases: ['Reboot'] }, remakeHit],
+    'Titre français': [originalHit, remakeHit],
+  };
+  const routes = {
+    '/login': { token: 'fixture-token' },
+    '/series/1/extended': original,
+    '/series/2/extended': remake,
+    '/seasons/31/extended': { ...airedSeason, episodes: [firstEpisode, secondEpisode] },
+    '/seasons/32/extended': { ...undatedSeason, episodes: [{ id: 24, number: 1, aired: null }] },
+    '/episodes/21/extended': { ...firstEpisode, seasonNumber: 3, number: 9, seasons: [dvdSeason, airedSeason] },
+    '/episodes/22/extended': dvdEpisode,
+    '/episodes/23/extended': { ...secondEpisode, seasonNumber: 2, number: 8 },
+    '/episodes/25/extended': { ...dvdEpisode, id: 25, seasons: [dvdSeason, airedSeason] },
+  };
+  const upstream = createServer((request, response) => {
+    const url = new URL(request.url, 'http://localhost');
+    const data = url.pathname === '/search' ? searches[url.searchParams.get('query')] : routes[url.pathname];
+    if (!data) {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
+  });
+  const baseUrl = await listen(upstream);
+  t.after(() => upstream.close());
+  const provider = createProvider({ api_key: 'fixture-key', baseUrl, spacingMs: 0 });
+  const base = await listen(provider);
+  t.after(() => provider.close());
+
+  const read = async (kind, id, status = 200) => {
+    const response = await fetch(base + '/library/metadata/' + kind + '-' + id + '?includeChildren=1');
+    assert.equal(response.status, status);
+    return (await response.json()).MediaContainer?.Metadata[0];
+  };
+  const match = async (body) => {
+    const response = await fetch(base + '/library/metadata/matches', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()).MediaContainer.Metadata;
+  };
+
+  const episode = await read('episode', 21);
+  assert.equal(episode.index, 1);
+  assert.equal(episode.parentIndex, 1);
+  assert.deepEqual(await match({ type: 4, guid: 'tvdb://21' }), [episode]);
+  const fallback = await read('episode', 23);
+  assert.equal(fallback.index, 2);
+  assert.equal(fallback.parentIndex, 1);
+  for (const id of [22, 25]) {
+    await read('episode', id, 404);
+    assert.deepEqual(await match({ type: 4, guid: 'tvdb://' + id }), []);
+  }
+
+  assert.deepEqual(await match({ type: 2, title: 'Original', year: 2024 }), []);
+  assert.equal((await match({ type: 2, title: 'Reboot', year: 2024 }))[0]?.ratingKey, 'show-2');
+  assert.equal((await match({ type: 2, title: 'Titre français', year: 2020 }))[0]?.ratingKey, 'show-1');
+  assert.deepEqual(await match({ type: 2, title: 'Titre français' }), []);
+
+  const season = await read('season', 31);
+  assert.equal(season.originallyAvailableAt, '2020-03-15');
+  assert.equal(season.year, 2020);
+  const [matchedSeason] = await match({ type: 3, parentTitle: 'Original', index: 1 });
+  assert.equal(matchedSeason.originallyAvailableAt, season.originallyAvailableAt);
+  const undated = await read('season', 32);
+  assert.equal(undated.originallyAvailableAt, undefined);
+  assert.equal(undated.year, undefined);
+});
+
 test('cache coalescing, persistence, default and configured expiration, and disabling', async (t) => {
   const { mkdtemp, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
