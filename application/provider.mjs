@@ -14,11 +14,36 @@ const orderAliases = new Map([
   ['default', defaultOrder], ['aired', defaultOrder], ['tvdbairing', defaultOrder],
   ['tvdbdvd', 'dvd'], ['tvdbabsolute', 'absolute'],
 ]);
+const artworkTypes = {
+  show: new Map([[2, 'coverPoster'], [3, 'background'], [23, 'clearLogo']]),
+  season: new Map([[7, 'coverPoster'], [8, 'background']]),
+  episode: new Map([[11, 'snapshot'], [12, 'snapshot']]),
+};
+const creditTypes = new Map([
+  [1, 'Director'], [2, 'Writer'], [3, 'Role'], [4, 'Role'], [7, 'Producer'], [11, 'Producer'],
+]);
+// TheTVDB uses three-letter codes for content ratings. Plex uses two-letter regions.
+const ratingRegions = {
+  are: 'AE', arg: 'AR', arm: 'AM', aus: 'AU', aut: 'AT', bel: 'BE', bgr: 'BG', bra: 'BR',
+  can: 'CA', chl: 'CL', col: 'CO', deu: 'DE', dnk: 'DK', ecu: 'EC', egy: 'EG', esp: 'ES',
+  est: 'EE', fin: 'FI', fra: 'FR', gbr: 'GB', grc: 'GR', hkg: 'HK', hrv: 'HR', hun: 'HU',
+  idn: 'ID', ind: 'IN', irl: 'IE', isl: 'IS', isr: 'IL', ita: 'IT', jam: 'JM', jpn: 'JP',
+  kaz: 'KZ', khm: 'KH', kor: 'KR', ltu: 'LT', lva: 'LV', mar: 'MA', mdv: 'MV', mex: 'MX',
+  mlt: 'MT', mys: 'MY', nga: 'NG', nld: 'NL', nor: 'NO', nzl: 'NZ', per: 'PE', phl: 'PH',
+  pol: 'PL', prt: 'PT', rou: 'RO', rus: 'RU', sau: 'SA', sgp: 'SG', slv: 'SV', svk: 'SK',
+  svn: 'SI', swe: 'SE', tha: 'TH', tur: 'TR', twn: 'TW', ukr: 'UA', usa: 'US', ven: 'VE',
+  vnm: 'VN', zaf: 'ZA',
+};
+const regionNames = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none' });
 
 /** Validates a Plex season, episode, or paging number. */
 const coordinates = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 /** Validates a positive TheTVDB numeric ID. */
 const numericId = (value) => /^[1-9][0-9]{0,14}$/.test(String(value));
+/** Treats absent or non-list optional TVDB fields as empty. */
+const list = (value) => Array.isArray(value) ? value : [];
+/** Keeps nonblank string metadata and omits incomplete upstream fields. */
+const label = (value) => typeof value === 'string' ? value.trim() : '';
 /** Normalizes a title or alias for exact comparison after ignoring punctuation. */
 const normalize = (name) => String(name || '').normalize('NFKC').toLowerCase()
   .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
@@ -38,11 +63,70 @@ function languageCode(value) {
   }
 }
 
+/** Converts Plex and TVDB country hints into a two-letter rating region. */
+function regionCode(value) {
+  const code = label(value).toLowerCase();
+  if (code === 'uk') return 'GB';
+  if (/^[a-z]{2}$/.test(code)) return code.toUpperCase();
+  return /^[a-z]{3}$/.test(code) && Object.hasOwn(ratingRegions, code) ? ratingRegions[code] : undefined;
+}
+
+/** Formats a Plex age rating for the requested country, defaulting to US when absent. */
+function contentRating(record, country) {
+  const region = country ? regionCode(country) : 'US';
+  if (!region) return undefined;
+  const rating = list(record.contentRatings).find((row) =>
+    regionCode(row?.country) === region && label(row?.name));
+  if (!rating) return undefined;
+  const name = label(rating.name);
+  return region === 'US' ? name : region.toLowerCase() + '/' + name;
+}
+
+/** Maps available artwork for the specific kind of item and keeps its primary image first. */
+function imagesFor(type, record) {
+  const images = new Map();
+  const primaryType = type === 'episode' ? 'snapshot' : 'coverPoster';
+  if (label(record.image)) {
+    images.set(primaryType + ':' + record.image, { type: primaryType, url: record.image });
+  }
+  for (const artwork of list(record.artworks ?? record.artwork)) {
+    const typeName = artworkTypes[type].get(artwork?.type);
+    const url = label(artwork?.image);
+    if (typeName && url) images.set(typeName + ':' + url, { type: typeName, url });
+  }
+  return [...images.values()];
+}
+
+/** Maps cast and crew using TVDB's credit types and Plex's person fields. */
+function creditsFor(record) {
+  const credits = {};
+  const people = list(record.characters).filter((person) => creditTypes.has(person?.type) && label(person.personName))
+    .sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0));
+  for (const person of people) {
+    const field = creditTypes.get(person.type);
+    const entry = { tag: label(person.personName) };
+    const thumb = label(person.personImgURL) || label(person.image);
+    if (thumb) entry.thumb = thumb;
+    const entries = credits[field] ??= [];
+    if (field === 'Role') {
+      if (label(person.name)) entry.role = label(person.name);
+      entry.order = entries.length;
+    }
+    entries.push(entry);
+  }
+  return credits;
+}
+
+/** Converts upstream names into a deduplicated Plex tag array. */
+function tagsFor(names) {
+  return [...new Set(names.map(label).filter(Boolean))].map((tag) => ({ tag }));
+}
+
 /** Builds the external GUID list that Plex and sync tools can use to identify an item. */
 function externalIds(record) {
   const ids = new Set([`tvdb://${record.id}`]);
-  for (const remote of record.remoteIds || []) {
-    const provider = String(remote.sourceName).toLowerCase();
+  for (const remote of list(record.remoteIds)) {
+    const provider = label(remote?.sourceName).toLowerCase();
     if (provider === 'imdb' && /^tt\d+$/.test(remote.id)) ids.add(`imdb://${remote.id}`);
     if (['themoviedb.com', 'tmdb', 'themoviedb'].includes(provider) && numericId(remote.id)) {
       ids.add(`tmdb://${remote.id}`);
@@ -55,15 +139,17 @@ function externalIds(record) {
 function describe(type, record, title, date, seasonId) {
   if (!numericId(record.id)) throw new RequestError(502, 'TVDB returned an invalid item ID');
   const ratingKey = itemKey(type, record.id, seasonId);
+  const images = imagesFor(type, record);
+  const thumb = images.find((image) => image.type === (type === 'episode' ? 'snapshot' : 'coverPoster'))?.url;
+  const art = images.find((image) => image.type === 'background')?.url;
   return {
     ratingKey, key: `${metadataPath}/${ratingKey}`, guid: guid(type, ratingKey), type, title,
     ...(date ? { originallyAvailableAt: date, year: Number(date.slice(0, 4)) } : {}),
     ...(record.originalTitle ? { originalTitle: record.originalTitle } : {}),
     summary: [record.overview, 'Metadata provided by TheTVDB\nhttps://thetvdb.com/'].filter(Boolean).join('\n\n'),
-    ...(record.image ? {
-      thumb: record.image,
-      Image: [{ type: type === 'episode' ? 'snapshot' : 'coverPoster', url: record.image }],
-    } : {}),
+    ...(thumb ? { thumb } : {}),
+    ...(art ? { art } : {}),
+    ...(images.length ? { Image: images } : {}),
     Guid: externalIds(record),
   };
 }
@@ -115,18 +201,33 @@ function seriesSeasons(series, order) {
 
 /** Formats show metadata shared by lookup, artwork, and match responses. */
 function showItem(series) {
-  return describe('show', series, series.name, series.firstAired);
+  const genre = tagsFor(list(series.genres).map((row) => row?.name));
+  const studios = tagsFor(list(series.companies)
+    .filter((company) => [2, 3].includes(company?.companyType?.companyTypeId ?? company?.primaryCompanyType))
+    .map((company) => company.name));
+  const region = regionCode(series.originalCountry);
+  const country = region && regionNames.of(region);
+  const network = label(series.originalNetwork?.name);
+  return {
+    ...describe('show', series, series.name, series.firstAired),
+    ...creditsFor(series),
+    ...(genre.length ? { Genre: genre } : {}),
+    ...(studios.length ? { studio: studios[0].tag, Studio: studios } : {}),
+    ...(country ? { Country: [{ tag: country }] } : {}),
+    ...(network ? { Network: [{ tag: network }] } : {}),
+    ...(series.averageRuntime > 0 ? { duration: series.averageRuntime * 60000 } : {}),
+  };
 }
 
 /** Uses the declared season name or the Plex label for a numbered season or specials. */
 const seasonTitle = (season) => season.name || (season.number === 0 ? 'Specials' : `Season ${season.number}`);
 
 /** Formats a season using the earliest dated episode in its selected order. */
-function seasonItem(series, season, episodeRows = []) {
-  const firstAired = episodeRows.map((episode) => episode.aired)
+function seasonItem(series, season, details) {
+  const firstAired = list(details?.episodes).map((episode) => episode.aired)
     .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date) && Number.isFinite(Date.parse(date))).sort()[0];
   return {
-    ...describe('season', season, seasonTitle(season), firstAired),
+    ...describe('season', { ...details, ...season }, seasonTitle(season), firstAired),
     ...ancestor('show', series.id, series.name, 'parent'),
     index: season.number,
   };
@@ -137,6 +238,7 @@ function episodeItem(series, season, episode) {
   const alternateSeasonId = seasonOrder(season) === defaultOrder ? undefined : season.id;
   return {
     ...describe('episode', episode, episode.name || `Episode ${episode.number}`, episode.aired, alternateSeasonId),
+    ...creditsFor(episode),
     ...ancestor('season', season.id, seasonTitle(season), 'parent'),
     ...ancestor('show', series.id, series.name, 'grandparent'),
     index: episode.number,
@@ -192,19 +294,22 @@ export function createProvider(config) {
   /** Fetches the extended season record, including its episodes. */
   const season = (id) => tvdb(`/seasons/${id}/extended`);
   /** Reads a season’s episode list, treating a missing list as empty. */
-  const episodes = (s) => Array.isArray(s.episodes) ? s.episodes : [];
+  const episodes = (s) => list(s?.episodes);
   /** Accepts either a JSON boolean or 1 for a Plex include flag. */
   const include = (value) => value === true || String(value) === '1';
 
-  /** Returns episode members of a listed season, even if its cached listing outlives the record. */
-  async function seasonEpisodes(id) {
+  /** Resolves a listed season whose cached summary may outlive its extended record. */
+  async function listedSeason(id) {
     try {
-      return episodes(await season(id));
+      return await season(id);
     } catch (error) {
       if (!(error instanceof RequestError) || error.status !== 404) throw error;
-      return [];
+      return undefined;
     }
   }
+
+  /** Returns the episode members of a listed season. */
+  const seasonEpisodes = async (id) => episodes(await listedSeason(id));
 
   /** Checks a listed alternate order for an episode that Plex can match by number. */
   async function hasNumberedEpisodes(showId, order, rows) {
@@ -240,11 +345,11 @@ export function createProvider(config) {
 
   /** Formats requested seasons, retaining the series summary if a season record is missing. */
   async function seasonItems(show, rows) {
-    return Promise.all(rows.map(async (row) => seasonItem(show, row, await seasonEpisodes(row.id))));
+    return Promise.all(rows.map(async (row) => seasonItem(show, row, await listedSeason(row.id))));
   }
 
   /** Loads requested children for every result before checking optional orders. */
-  async function itemResults(items, includeChildren) {
+  async function itemResults(items, includeChildren, country) {
     const results = [];
     for (const { item, children, series: show } of items) {
       const childItems = includeChildren && item.type !== 'episode'
@@ -253,7 +358,11 @@ export function createProvider(config) {
       results.push(childItems ? withChildren(item, childItems) : item);
     }
     for (const [index, { series: show }] of items.entries()) {
-      if (show) results[index] = await showMetadata(show, results[index]);
+      if (show) {
+        const rating = contentRating(show, country);
+        const item = rating ? { ...results[index], contentRating: rating } : results[index];
+        results[index] = await showMetadata(show, item);
+      }
     }
     return results;
   }
@@ -271,7 +380,7 @@ export function createProvider(config) {
       const row = seriesSeasons(s, order).find((part) => String(part.id) === id);
       if (!row) throw new RequestError(404, 'TVDB season not found in the requested order');
       const episodeRows = episodes(seasonData);
-      return { item: seasonItem(s, row, episodeRows), children: episodeRows.map((e) => episodeItem(s, row, e)) };
+      return { item: seasonItem(s, row, seasonData), children: episodeRows.map((e) => episodeItem(s, row, e)) };
     }
     const e = await tvdb(`/episodes/${id}/extended`);
     if (!numericId(e.seriesId) || String(e.id) !== id) throw new RequestError(502, 'TVDB returned an invalid episode');
@@ -290,26 +399,38 @@ export function createProvider(config) {
     throw new RequestError(404, 'TVDB episode not found in the requested order');
   }
 
+  /** Resolves a remote series ID and checks the source for numeric IDs shared by providers. */
+  async function findRemoteSeries(id, language, expectedGuid) {
+    let results;
+    try {
+      results = await tvdb(`/search/remoteid/${id}`);
+    } catch (error) {
+      if (error instanceof RequestError && error.status === 404) return [];
+      throw error;
+    }
+    if (!Array.isArray(results)) throw new RequestError(502, 'TVDB external ID lookup has no results array');
+    const ids = new Set(results.map((row) => row?.series?.id).filter(numericId).map(String));
+    if (!expectedGuid && ids.size !== 1) return [];
+    const shows = [];
+    for (const seriesId of ids) {
+      try {
+        const record = await series(seriesId, language);
+        if (!expectedGuid || externalIds(record).some(({ id }) => id === expectedGuid)) shows.push(record);
+      } catch (error) {
+        if (!(error instanceof RequestError) || error.status !== 404 || !expectedGuid) throw error;
+      }
+      if (shows.length > 1) return [];
+    }
+    return shows;
+  }
+
   /** Resolves the show by file ID first, then by title and year when no ID is present. */
   async function findSeries(title, year, manual, file, language) {
     const path = typeof file === 'string' ? file : '';
     const namedId = path.match(/\{tvdb-([1-9][0-9]{0,14})\}/i)?.[1];
     if (namedId) return [await series(namedId, language)];
     const imdbId = path.match(/(?<![\p{L}\p{N}])imdb-(tt[0-9]{1,15})(?![\p{L}\p{N}])/iu)?.[1].toLowerCase();
-    if (imdbId) {
-      let results;
-      try {
-        results = await tvdb(`/search/remoteid/${imdbId}`);
-      } catch (error) {
-        if (error instanceof RequestError && error.status === 404) return [];
-        throw error;
-      }
-      if (!Array.isArray(results)) throw new RequestError(502, 'TVDB external ID lookup has no results array');
-      const matches = new Set(results.map((row) => row?.series?.id).filter(numericId).map(String));
-      if (matches.size !== 1) return [];
-      const [id] = matches;
-      return [await series(id, language)];
-    }
+    if (imdbId) return findRemoteSeries(imdbId, language);
     title = typeof title === 'string' ? title.trim().slice(0, 220) : '';
     if (!title) return [];
     const query = new URLSearchParams({ query: title, type: 'series' });
@@ -342,15 +463,16 @@ export function createProvider(config) {
   }
 
   /** Translates a Plex match request into candidates for a show, season, or episode. */
-  async function match(body, language) {
+  async function match(body, language, country) {
     const kind = Number.isInteger(body.type) ? kinds[body.type] : undefined;
     if (!kind) throw new RequestError(400, 'Unsupported metadata type');
     const order = requestedOrder(body.episodeOrder ?? body.episodeOrdering);
-    const external = typeof body.guid === 'string' ? body.guid.match(/^tvdb:\/\/([1-9][0-9]{0,14})$/)?.[1] : null;
+    const hint = typeof body.guid === 'string' ? body.guid.toLowerCase() : '';
+    const external = hint.match(/^tvdb:\/\/([1-9][0-9]{0,14})$/)?.[1];
     if (external) {
       try {
         const loaded = await load(kind, external, language, order);
-        return envelope(await itemResults([loaded], include(body.includeChildren)));
+        return envelope(await itemResults([loaded], include(body.includeChildren), country));
       } catch (error) {
         if (error instanceof RequestError && error.status === 404) return envelope([]);
         throw error;
@@ -358,12 +480,15 @@ export function createProvider(config) {
     }
     const manual = include(body.manual);
     const name = { show: body.title, season: body.parentTitle, episode: body.grandparentTitle }[kind];
-    const shows = await findSeries(name, kind === 'show' ? body.year : null, manual, body.filename, language);
+    const remote = kind === 'show' && hint.match(/^(?:imdb:\/\/(tt[0-9]{1,15})|tmdb:\/\/([1-9][0-9]{0,14}))$/);
+    const shows = remote
+      ? await findRemoteSeries(remote[1] ?? remote[2], language, remote[2] && hint)
+      : await findSeries(name, kind === 'show' ? body.year : null, manual, body.filename, language);
     if (kind === 'show') {
       const items = shows.map((show) => ({
         item: showItem(show), children: seriesSeasons(show, order ?? defaultOrder), series: show,
       }));
-      return envelope(await itemResults(items, include(body.includeChildren)));
+      return envelope(await itemResults(items, include(body.includeChildren), country));
     }
     const matches = [];
     for (const show of shows) {
@@ -371,10 +496,10 @@ export function createProvider(config) {
       if (kind === 'season') {
         const row = seasons.find((item) => item.number === body.index);
         if (!row) continue;
-        const episodeRows = episodes(await season(row.id));
-        const item = seasonItem(show, row, episodeRows);
+        const details = await season(row.id);
+        const item = seasonItem(show, row, details);
         matches.push(include(body.includeChildren)
-          ? withChildren(item, episodeRows.map((e) => episodeItem(show, row, e))) : item);
+          ? withChildren(item, episodes(details).map((e) => episodeItem(show, row, e))) : item);
       } else {
         for (const row of seasons.filter((item) => !coordinates(body.parentIndex) || item.number === body.parentIndex)) {
           for (const episode of await seasonEpisodes(row.id)) {
@@ -407,6 +532,7 @@ export function createProvider(config) {
       const url = new URL(request.url, 'http://localhost');
       path = url.pathname;
       const language = languageCode(request.headers['x-plex-language'] || url.searchParams.get('X-Plex-Language'));
+      const country = request.headers['x-plex-country'] || url.searchParams.get('X-Plex-Country');
       if (request.method === 'GET' && url.pathname === '/health') {
         body = { status: 'ok' };
       } else if (request.method === 'GET' && url.pathname === '/stats') {
@@ -418,7 +544,7 @@ export function createProvider(config) {
           Feature: [{ type: 'metadata', key: metadataPath }, { type: 'match', key: metadataPath + '/matches' }],
         } };
       } else if (request.method === 'POST' && url.pathname === metadataPath + '/matches') {
-        body = await match(await readBody(request), language);
+        body = await match(await readBody(request), language, country);
       } else {
         const parsed = url.pathname.match(/^\/library\/metadata\/(show|season|episode)-([1-9][0-9]{0,14})(?:-([1-9][0-9]{0,14}))?(?:\/(children|grandchildren|images))?$/);
         if (request.method !== 'GET' || !parsed) throw new RequestError(404, 'Unknown endpoint');
@@ -442,7 +568,7 @@ export function createProvider(config) {
           const images = item.Image || [];
           body = { MediaContainer: { identifier, offset: 0, size: images.length, totalSize: images.length, Image: images } };
         } else {
-          body = envelope(await itemResults([loaded], include(url.searchParams.get('includeChildren'))));
+          body = envelope(await itemResults([loaded], include(url.searchParams.get('includeChildren')), country));
         }
       }
     } catch (error) {

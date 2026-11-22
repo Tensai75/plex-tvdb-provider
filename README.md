@@ -1,6 +1,6 @@
 # Plex TVDB Provider
 
-A self-hosted [TheTVDB](https://thetvdb.com/) metadata provider for Plex TV libraries. It supplies show, season, and episode metadata and artwork using TheTVDB episode orders, including specials. Multiple Plex servers can use one instance and share a persistent SQLite cache. The provider coalesces concurrent requests for the same metadata and honors TheTVDB rate-limit responses.
+A self-hosted [TheTVDB](https://thetvdb.com/) metadata provider for Plex TV libraries. It supplies show, season, and episode metadata using TheTVDB episode orders, including specials. Where TheTVDB has the data, Plex receives cast and crew, genres, networks and studios, regional content ratings, posters, backgrounds, logos, and episode snapshots. Multiple Plex servers can use one instance and share a persistent SQLite cache. The provider coalesces concurrent requests for the same metadata and honors TheTVDB rate-limit responses.
 
 ## Install with Docker Compose
 
@@ -47,7 +47,9 @@ The provider defaults to **TheTVDB (Aired)**. To use a different order, open the
 
 ## How show matching works
 
-When Plex sends a media path with an IMDb ID, the provider looks it up in TheTVDB and uses it when it identifies exactly one series. A show folder can include `imdb-tt1234567`, `{imdb-tt1234567}`, `[imdb-tt1234567]`, or `(imdb-tt1234567)`. A `{tvdb-123456}` tag also works and takes precedence if both are present. When Plex sends no supported ID, the provider searches by show title or alias and uses the year when available.
+When Plex supplies an external show GUID in a match request, the provider accepts `tvdb://123456`, `imdb://tt1234567`, and `tmdb://123456`. A remote ID must identify one series, and numeric TMDB IDs must match that series' TMDB cross-reference. Metadata and episode ordering come from TheTVDB for all three ID formats.
+
+When Plex sends a media path with an IMDb ID, the provider can also use that ID. A show folder can include `imdb-tt1234567`, `{imdb-tt1234567}`, `[imdb-tt1234567]`, or `(imdb-tt1234567)`. A `{tvdb-123456}` tag takes precedence if both are present. When Plex sends no supported ID, the provider searches by show title or alias and uses the year when available.
 
 In **Sonarr → Settings → Media Management**, enable **Show Advanced**. This **Series Folder Format** adds the IMDb ID.
 

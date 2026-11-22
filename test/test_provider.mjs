@@ -296,7 +296,8 @@ test('Plex uses one provider for Aired, DVD, Absolute and named episode orders',
   const absolute = { id: 32, seriesId: 1, number: 1, type: { id: 3, type: 'absolute' } };
   const streaming = { id: 33, seriesId: 1, number: 2, type: { id: 4, type: 'alternate', alternateName: 'Streaming Order' } };
   const allOrders = [aired, dvd, absolute, streaming];
-  const data = { id: 1, name: 'Example', firstAired: '2021-01-01', defaultSeasonType: 2, seasons: allOrders };
+  const data = { id: 1, name: 'Example', firstAired: '2021-01-01', defaultSeasonType: 2, seasons: allOrders,
+    remoteIds: [{ sourceName: 'TheMovieDB.com', id: '42' }] };
   const shared = { id: 21, seriesId: 1, name: 'Shared episode', aired: '2021-01-01', seasons: [aired, dvd, absolute] };
   const recut = { id: 41, seriesId: 1, name: 'Streaming cut', aired: '2021-04-21', seasons: [streaming] };
   const placeholder = { id: 50, seriesId: 2, number: 1, type: { id: 3, type: 'absolute' } };
@@ -306,6 +307,7 @@ test('Plex uses one provider for Aired, DVD, Absolute and named episode orders',
   const upstreamRoutes = {
     '/login': { token: 'fixture-token' },
     '/search': [{ tvdb_id: '1', name: 'Example', year: '2021' }],
+    '/search/remoteid/42': [{ series: { id: 1 } }],
     '/series/1/extended': data,
     '/series/2/extended': { id: 2, name: 'Partially populated show', firstAired: '2021-01-01',
       seasons: [{ ...aired, id: 49, seriesId: 2 }, placeholder, specialsOnly, datedRegularSeason, emptyFirstDvdSeason] },
@@ -371,6 +373,8 @@ test('Plex uses one provider for Aired, DVD, Absolute and named episode orders',
     const [showMatch] = await match({ type: 2, guid: 'tvdb://1', episodeOrder: order, includeChildren: 1 });
     assert.equal(showMatch.guid, show.guid);
     assert.equal(showMatch.Children.Metadata[0].ratingKey, seasonKey);
+    assert.deepEqual(await match({ type: 2, guid: 'tmdb://42', episodeOrder: order, includeChildren: 1 }),
+      [showMatch]);
     const [seasonMatch] = await match({ type: 3, parentTitle: 'Example', index: selected.number,
       episodeOrder: order, includeChildren: 1 });
     assert.equal(seasonMatch.key, datedSeason.key);
@@ -559,6 +563,128 @@ test('show requests keep available orders and load requested seasons before opti
     ]);
     assert.deepEqual(seasonRequests, ['/seasons/12/extended', '/seasons/22/extended', '/seasons/31/extended']);
   });
+});
+
+test('direct external show GUIDs return the same Plex identity, artwork and enriched metadata as title matches', async (t) => {
+  const poster = 'https://artworks.thetvdb.com/poster-alternate.jpg';
+  const background = 'https://artworks.thetvdb.com/background.jpg';
+  const logo = 'https://artworks.thetvdb.com/logo.png';
+  const seasonBackground = 'https://artworks.thetvdb.com/season-background.jpg';
+  const photo = 'https://artworks.thetvdb.com/cast.jpg';
+  const enriched = {
+    ...series,
+    averageRuntime: 30,
+    originalCountry: 'usa',
+    originalNetwork: { name: 'Example Network' },
+    genres: [{ name: 'Comedy' }, null, { name: 'Comedy' }],
+    companies: [
+      { name: 'Example Network', primaryCompanyType: 1 },
+      { name: 'Example Studio', companyType: { companyTypeId: 2 } },
+    ],
+    characters: [
+      { type: 4, personName: 'Guest Actor', name: 'Guest', sort: 2 },
+      { type: 3, personName: 'Main Actor', name: 'Lead', personImgURL: photo, sort: 1 },
+      { type: 2, personName: 'The Writer' },
+      { type: 1, personName: 'The Director' },
+      { type: 11, personName: 'The Producer' },
+      { type: 3, name: 'No credited actor' },
+    ],
+    contentRatings: [{ country: 'usa', name: 'TV-14' }, { country: 'can', name: 'PG' }],
+    artworks: [
+      { type: 2, image: series.image }, { type: 2, image: poster },
+      { type: 3, image: background }, { type: 23, image: logo },
+      { type: 7, image: 'https://artworks.thetvdb.com/unrelated-season.jpg' }, null,
+    ],
+    remoteIds: [...series.remoteIds, { sourceName: 'TheMovieDB.com', id: '1668' }],
+    seasons: series.seasons.slice(0, 2),
+  };
+  const collision = { id: 2, name: 'Different show', remoteIds: [{ sourceName: 'Other Provider', id: '1668' }] };
+  const tmdbDuplicate = (id) => ({ id, name: 'Duplicate', remoteIds: [{ sourceName: 'TMDB', id: '444' }] });
+  const routes = {
+    '/login': { token: 'fixture-token' },
+    '/search': [{ tvdb_id: '1', name: 'Example', year: '2021' }],
+    '/search/remoteid/tt0123456': [{ series: { id: 1 } }, { movie: { id: 44 } }],
+    '/search/remoteid/1668': [{ series: { id: 2 } }, { movie: { id: 7 } }, { series: { id: 1 } }, { series: { id: 1 } }],
+    '/search/remoteid/777': [{ series: { id: 2 } }],
+    '/search/remoteid/444': [{ series: { id: 3 } }, { series: { id: 4 } }],
+    '/series/1/extended': enriched,
+    '/series/2/extended': collision,
+    '/series/3/extended': tmdbDuplicate(3),
+    '/series/4/extended': tmdbDuplicate(4),
+    '/seasons/11/extended': special,
+    '/seasons/12/extended': { ...aired, artwork: [{ type: 8, image: seasonBackground }] },
+    '/episodes/202/extended': { ...episodes[2], characters: [{ type: 1, personName: 'Episode Director' }] },
+  };
+  const requests = [];
+  const upstream = createServer((request, response) => {
+    const { pathname } = new URL(request.url, 'http://localhost');
+    requests.push(pathname);
+    if (pathname === '/search/remoteid/888') return response.writeHead(429, { 'Retry-After': '8' }).end();
+    const data = routes[pathname];
+    if (!data) return response.writeHead(404).end();
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
+  });
+  const baseUrl = await listen(upstream);
+  t.after(() => upstream.close());
+  const provider = createProvider({ api_key: 'fixture-key', baseUrl, spacingMs: 0 });
+  const base = await listen(provider);
+  t.after(() => provider.close());
+  const get = async (path, options) => {
+    const response = await fetch(base + path, options);
+    assert.equal(response.status, 200);
+    return (await response.json()).MediaContainer;
+  };
+  const matchOptions = (params) => ({
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Plex-Country': 'CA' },
+    body: JSON.stringify({ type: 2, includeChildren: 1, ...params }),
+  });
+  const match = (params) => get('/library/metadata/matches', matchOptions(params));
+
+  const [byTitle] = (await match({ title: 'Example' })).Metadata;
+  assert.deepEqual(byTitle.Guid.map(({ id }) => id), ['tvdb://1', 'imdb://tt0123456', 'tmdb://1668']);
+  for (const id of ['tvdb://1', 'imdb://tt0123456', 'tmdb://1668']) {
+    const [byId] = (await match({ guid: id, title: 'Unrelated' })).Metadata;
+    assert.deepEqual(byId, byTitle, id);
+  }
+  for (const guid of ['imdb://tt9999999', 'tmdb://777', 'tmdb://444']) {
+    assert.equal((await match({ guid, title: 'Example' })).size, 0);
+  }
+  assert.equal(requests.filter((path) => path === '/search').length, 1);
+  assert.equal(requests.filter((path) => path === '/series/1/extended').length, 1);
+
+  assert.equal(byTitle.duration, 1800000);
+  assert.equal(byTitle.contentRating, 'ca/PG');
+  assert.deepEqual(byTitle.Genre, [{ tag: 'Comedy' }]);
+  assert.deepEqual(byTitle.Country, [{ tag: 'United States' }]);
+  assert.deepEqual(byTitle.Network, [{ tag: 'Example Network' }]);
+  assert.deepEqual(byTitle.Studio, [{ tag: 'Example Studio' }]);
+  assert.deepEqual(byTitle.Role, [
+    { tag: 'Main Actor', role: 'Lead', thumb: photo, order: 0 },
+    { tag: 'Guest Actor', role: 'Guest', order: 1 },
+  ]);
+  assert.deepEqual(byTitle.Director, [{ tag: 'The Director' }]);
+  assert.deepEqual(byTitle.Writer, [{ tag: 'The Writer' }]);
+  assert.deepEqual(byTitle.Producer, [{ tag: 'The Producer' }]);
+  assert.equal(byTitle.thumb, series.image);
+  assert.equal(byTitle.art, background);
+  assert.deepEqual(byTitle.Image, [
+    { type: 'coverPoster', url: series.image }, { type: 'coverPoster', url: poster },
+    { type: 'background', url: background }, { type: 'clearLogo', url: logo },
+  ]);
+  assert.deepEqual((await get(byTitle.key + '/images')).Image, byTitle.Image);
+  assert.deepEqual((await get(byTitle.key + '?includeChildren=1&X-Plex-Country=CAN')).Metadata[0], byTitle);
+  assert.equal((await get(byTitle.key)).Metadata[0].contentRating, 'TV-14');
+  assert.equal((await get(byTitle.key + '?X-Plex-Country=GB')).Metadata[0].contentRating, undefined);
+  const season = byTitle.Children.Metadata[1];
+  assert.deepEqual((await get(season.key)).Metadata[0], season);
+  assert.deepEqual((await get(season.key + '/images')).Image, [
+    { type: 'coverPoster', url: aired.image }, { type: 'background', url: seasonBackground },
+  ]);
+  assert.deepEqual((await get('/library/metadata/episode-202')).Metadata[0].Director, [{ tag: 'Episode Director' }]);
+
+  const limited = await fetch(base + '/library/metadata/matches', matchOptions({ guid: 'tmdb://888' }));
+  assert.equal(limited.status, 503);
+  assert.equal(limited.headers.get('retry-after'), '8');
 });
 
 test('custom provider identifiers preserve case and reject disallowed characters', () => {
