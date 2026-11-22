@@ -82,16 +82,25 @@ function contentRating(record, country) {
   return region === 'US' ? name : region.toLowerCase() + '/' + name;
 }
 
+/** Resolves TVDB artwork paths to public HTTP URLs. */
+function artworkUrl(value) {
+  const path = label(value);
+  if (!path) return undefined;
+  const url = URL.parse(path, 'https://artworks.thetvdb.com/');
+  return url && ['http:', 'https:'].includes(url.protocol) ? url.href : undefined;
+}
+
 /** Maps available artwork for the specific kind of item and keeps its primary image first. */
 function imagesFor(type, record) {
   const images = new Map();
   const primaryType = type === 'episode' ? 'snapshot' : 'coverPoster';
-  if (label(record.image)) {
-    images.set(primaryType + ':' + record.image, { type: primaryType, url: record.image });
+  const primaryUrl = artworkUrl(record.image);
+  if (primaryUrl) {
+    images.set(primaryType + ':' + primaryUrl, { type: primaryType, url: primaryUrl });
   }
   for (const artwork of list(record.artworks ?? record.artwork)) {
     const typeName = artworkTypes[type].get(artwork?.type);
-    const url = label(artwork?.image);
+    const url = artworkUrl(artwork?.image);
     if (typeName && url) images.set(typeName + ':' + url, { type: typeName, url });
   }
   return [...images.values()];
@@ -105,7 +114,7 @@ function creditsFor(record) {
   for (const person of people) {
     const field = creditTypes.get(person.type);
     const entry = { tag: label(person.personName) };
-    const thumb = label(person.personImgURL) || label(person.image);
+    const thumb = artworkUrl(person.personImgURL) || artworkUrl(person.image);
     if (thumb) entry.thumb = thumb;
     const entries = credits[field] ??= [];
     if (field === 'Role') {
@@ -122,12 +131,15 @@ function tagsFor(names) {
   return [...new Set(names.map(label).filter(Boolean))].map((tag) => ({ tag }));
 }
 
+/** Falls back to TVDB's primary company type when the nested type is unknown. */
+const companyType = (company) => company?.companyType?.companyTypeId || company?.primaryCompanyType;
+
 /** Builds the external GUID list that Plex and sync tools can use to identify an item. */
 function externalIds(record) {
   const ids = new Set([`tvdb://${record.id}`]);
   for (const remote of list(record.remoteIds)) {
     const provider = label(remote?.sourceName).toLowerCase();
-    if (provider === 'imdb' && /^tt\d+$/.test(remote.id)) ids.add(`imdb://${remote.id}`);
+    if (provider === 'imdb' && /^tt\d+$/i.test(remote.id)) ids.add(`imdb://${remote.id.toLowerCase()}`);
     if (['themoviedb.com', 'tmdb', 'themoviedb'].includes(provider) && numericId(remote.id)) {
       ids.add(`tmdb://${remote.id}`);
     }
@@ -136,12 +148,13 @@ function externalIds(record) {
 }
 
 /** Formats the metadata fields and artwork shared by shows, seasons, and episodes. */
-function describe(type, record, title, date, seasonId) {
+function describe(type, record, title, date, { seasonId, country } = {}) {
   if (!numericId(record.id)) throw new RequestError(502, 'TVDB returned an invalid item ID');
   const ratingKey = itemKey(type, record.id, seasonId);
   const images = imagesFor(type, record);
   const thumb = images.find((image) => image.type === (type === 'episode' ? 'snapshot' : 'coverPoster'))?.url;
   const art = images.find((image) => image.type === 'background')?.url;
+  const rating = contentRating(record, country);
   return {
     ratingKey, key: `${metadataPath}/${ratingKey}`, guid: guid(type, ratingKey), type, title,
     ...(date ? { originallyAvailableAt: date, year: Number(date.slice(0, 4)) } : {}),
@@ -149,6 +162,7 @@ function describe(type, record, title, date, seasonId) {
     summary: [record.overview, 'Metadata provided by TheTVDB\nhttps://thetvdb.com/'].filter(Boolean).join('\n\n'),
     ...(thumb ? { thumb } : {}),
     ...(art ? { art } : {}),
+    ...(rating ? { contentRating: rating } : {}),
     ...(images.length ? { Image: images } : {}),
     Guid: externalIds(record),
   };
@@ -200,21 +214,25 @@ function seriesSeasons(series, order) {
 }
 
 /** Formats show metadata shared by lookup, artwork, and match responses. */
-function showItem(series) {
+function showItem(series, country) {
   const genre = tagsFor(list(series.genres).map((row) => row?.name));
-  const studios = tagsFor(list(series.companies)
-    .filter((company) => [2, 3].includes(company?.companyType?.companyTypeId ?? company?.primaryCompanyType))
+  const companies = list(series.companies);
+  const studios = tagsFor(companies.filter((company) => [2, 3].includes(companyType(company)))
     .map((company) => company.name));
   const region = regionCode(series.originalCountry);
-  const country = region && regionNames.of(region);
-  const network = label(series.originalNetwork?.name);
+  const origin = region && regionNames.of(region);
+  const networks = tagsFor([
+    series.originalNetwork?.name,
+    ...companies.filter((company) => companyType(company) === 1).map((company) => company.name),
+    series.latestNetwork?.name,
+  ]);
   return {
-    ...describe('show', series, series.name, series.firstAired),
+    ...describe('show', series, series.name, series.firstAired, { country }),
     ...creditsFor(series),
     ...(genre.length ? { Genre: genre } : {}),
     ...(studios.length ? { studio: studios[0].tag, Studio: studios } : {}),
-    ...(country ? { Country: [{ tag: country }] } : {}),
-    ...(network ? { Network: [{ tag: network }] } : {}),
+    ...(origin ? { Country: [{ tag: origin }] } : {}),
+    ...(networks.length ? { Network: networks } : {}),
     ...(series.averageRuntime > 0 ? { duration: series.averageRuntime * 60000 } : {}),
   };
 }
@@ -234,10 +252,10 @@ function seasonItem(series, season, details) {
 }
 
 /** Formats an episode with its season number, ancestry, and runtime in milliseconds. */
-function episodeItem(series, season, episode) {
-  const alternateSeasonId = seasonOrder(season) === defaultOrder ? undefined : season.id;
+function episodeItem(series, season, episode, country) {
+  const seasonId = seasonOrder(season) === defaultOrder ? undefined : season.id;
   return {
-    ...describe('episode', episode, episode.name || `Episode ${episode.number}`, episode.aired, alternateSeasonId),
+    ...describe('episode', episode, episode.name || `Episode ${episode.number}`, episode.aired, { seasonId, country }),
     ...creditsFor(episode),
     ...ancestor('season', season.id, seasonTitle(season), 'parent'),
     ...ancestor('show', series.id, series.name, 'grandparent'),
@@ -349,7 +367,7 @@ export function createProvider(config) {
   }
 
   /** Loads requested children for every result before checking optional orders. */
-  async function itemResults(items, includeChildren, country) {
+  async function itemResults(items, includeChildren) {
     const results = [];
     for (const { item, children, series: show } of items) {
       const childItems = includeChildren && item.type !== 'episode'
@@ -358,20 +376,16 @@ export function createProvider(config) {
       results.push(childItems ? withChildren(item, childItems) : item);
     }
     for (const [index, { series: show }] of items.entries()) {
-      if (show) {
-        const rating = contentRating(show, country);
-        const item = rating ? { ...results[index], contentRating: rating } : results[index];
-        results[index] = await showMetadata(show, item);
-      }
+      if (show) results[index] = await showMetadata(show, results[index]);
     }
     return results;
   }
 
   /** Loads a known TheTVDB item and its Plex hierarchy. */
-  async function load(kind, id, language, order, seasonId) {
+  async function load(kind, id, { language, order, seasonId, country }) {
     if (kind === 'show') {
       const s = await series(id, language);
-      return { item: showItem(s), children: seriesSeasons(s, order ?? defaultOrder), series: s };
+      return { item: showItem(s, country), children: seriesSeasons(s, order ?? defaultOrder), series: s };
     }
     if (kind === 'season') {
       const seasonData = await season(id);
@@ -380,7 +394,7 @@ export function createProvider(config) {
       const row = seriesSeasons(s, order).find((part) => String(part.id) === id);
       if (!row) throw new RequestError(404, 'TVDB season not found in the requested order');
       const episodeRows = episodes(seasonData);
-      return { item: seasonItem(s, row, seasonData), children: episodeRows.map((e) => episodeItem(s, row, e)) };
+      return { item: seasonItem(s, row, seasonData), children: episodeRows.map((e) => episodeItem(s, row, e, country)) };
     }
     const e = await tvdb(`/episodes/${id}/extended`);
     if (!numericId(e.seriesId) || String(e.id) !== id) throw new RequestError(502, 'TVDB returned an invalid episode');
@@ -394,13 +408,14 @@ export function createProvider(config) {
       : seasons.filter((row) => e.seasons.some((part) => String(part.id) === String(row.id)));
     for (const row of candidates) {
       const member = (await seasonEpisodes(row.id)).find((part) => String(part.id) === id && coordinates(part.number));
-      if (member) return { item: episodeItem(s, row, { ...e, number: member.number }), children: [] };
+      if (member) return { item: episodeItem(s, row, { ...e, number: member.number }, country), children: [] };
     }
     throw new RequestError(404, 'TVDB episode not found in the requested order');
   }
 
-  /** Resolves a remote series ID and checks the source for numeric IDs shared by providers. */
-  async function findRemoteSeries(id, language, expectedGuid) {
+  /** Resolves an external GUID only when one series still declares that cross-reference. */
+  async function findRemoteSeries(expectedGuid, language) {
+    const [, id] = expectedGuid.split('://');
     let results;
     try {
       results = await tvdb(`/search/remoteid/${id}`);
@@ -410,14 +425,13 @@ export function createProvider(config) {
     }
     if (!Array.isArray(results)) throw new RequestError(502, 'TVDB external ID lookup has no results array');
     const ids = new Set(results.map((row) => row?.series?.id).filter(numericId).map(String));
-    if (!expectedGuid && ids.size !== 1) return [];
     const shows = [];
     for (const seriesId of ids) {
       try {
         const record = await series(seriesId, language);
-        if (!expectedGuid || externalIds(record).some(({ id }) => id === expectedGuid)) shows.push(record);
+        if (externalIds(record).some(({ id }) => id === expectedGuid)) shows.push(record);
       } catch (error) {
-        if (!(error instanceof RequestError) || error.status !== 404 || !expectedGuid) throw error;
+        if (!(error instanceof RequestError) || error.status !== 404) throw error;
       }
       if (shows.length > 1) return [];
     }
@@ -430,7 +444,7 @@ export function createProvider(config) {
     const namedId = path.match(/\{tvdb-([1-9][0-9]{0,14})\}/i)?.[1];
     if (namedId) return [await series(namedId, language)];
     const imdbId = path.match(/(?<![\p{L}\p{N}])imdb-(tt[0-9]{1,15})(?![\p{L}\p{N}])/iu)?.[1].toLowerCase();
-    if (imdbId) return findRemoteSeries(imdbId, language);
+    if (imdbId) return findRemoteSeries(`imdb://${imdbId}`, language);
     title = typeof title === 'string' ? title.trim().slice(0, 220) : '';
     if (!title) return [];
     const query = new URLSearchParams({ query: title, type: 'series' });
@@ -471,8 +485,8 @@ export function createProvider(config) {
     const external = hint.match(/^tvdb:\/\/([1-9][0-9]{0,14})$/)?.[1];
     if (external) {
       try {
-        const loaded = await load(kind, external, language, order);
-        return envelope(await itemResults([loaded], include(body.includeChildren), country));
+        const loaded = await load(kind, external, { language, order, country });
+        return envelope(await itemResults([loaded], include(body.includeChildren)));
       } catch (error) {
         if (error instanceof RequestError && error.status === 404) return envelope([]);
         throw error;
@@ -480,15 +494,15 @@ export function createProvider(config) {
     }
     const manual = include(body.manual);
     const name = { show: body.title, season: body.parentTitle, episode: body.grandparentTitle }[kind];
-    const remote = kind === 'show' && hint.match(/^(?:imdb:\/\/(tt[0-9]{1,15})|tmdb:\/\/([1-9][0-9]{0,14}))$/);
+    const remote = kind === 'show' && /^(?:imdb:\/\/tt[0-9]{1,15}|tmdb:\/\/[1-9][0-9]{0,14})$/.test(hint);
     const shows = remote
-      ? await findRemoteSeries(remote[1] ?? remote[2], language, remote[2] && hint)
+      ? await findRemoteSeries(hint, language)
       : await findSeries(name, kind === 'show' ? body.year : null, manual, body.filename, language);
     if (kind === 'show') {
       const items = shows.map((show) => ({
-        item: showItem(show), children: seriesSeasons(show, order ?? defaultOrder), series: show,
+        item: showItem(show, country), children: seriesSeasons(show, order ?? defaultOrder), series: show,
       }));
-      return envelope(await itemResults(items, include(body.includeChildren), country));
+      return envelope(await itemResults(items, include(body.includeChildren)));
     }
     const matches = [];
     for (const show of shows) {
@@ -499,13 +513,13 @@ export function createProvider(config) {
         const details = await season(row.id);
         const item = seasonItem(show, row, details);
         matches.push(include(body.includeChildren)
-          ? withChildren(item, episodes(details).map((e) => episodeItem(show, row, e))) : item);
+          ? withChildren(item, episodes(details).map((e) => episodeItem(show, row, e, country))) : item);
       } else {
         for (const row of seasons.filter((item) => !coordinates(body.parentIndex) || item.number === body.parentIndex)) {
           for (const episode of await seasonEpisodes(row.id)) {
             const exact = coordinates(body.parentIndex) && coordinates(body.index)
               ? episode.number === body.index : Boolean(body.date && episode.aired === body.date);
-            if (exact) matches.push(episodeItem(show, row, episode));
+            if (exact) matches.push(episodeItem(show, row, episode, country));
           }
         }
       }
@@ -554,21 +568,21 @@ export function createProvider(config) {
         if (kind === 'episode' && !seasonId && order && order !== defaultOrder) {
           throw new RequestError(404, 'Episode key belongs to Aired order');
         }
-        const loaded = await load(kind, id, language, order, seasonId);
+        const loaded = await load(kind, id, { language, order, seasonId, country });
         const { item, children, series: show } = loaded;
         if (part === 'children') {
           body = await page(request, url, children, show);
         } else if (part === 'grandchildren') {
           const rows = [];
           for (const row of show ? children : []) {
-            rows.push(...(await seasonEpisodes(row.id)).map((e) => episodeItem(show, row, e)));
+            rows.push(...(await seasonEpisodes(row.id)).map((e) => episodeItem(show, row, e, country)));
           }
           body = await page(request, url, rows);
         } else if (part === 'images') {
           const images = item.Image || [];
           body = { MediaContainer: { identifier, offset: 0, size: images.length, totalSize: images.length, Image: images } };
         } else {
-          body = envelope(await itemResults([loaded], include(url.searchParams.get('includeChildren')), country));
+          body = envelope(await itemResults([loaded], include(url.searchParams.get('includeChildren'))));
         }
       }
     } catch (error) {

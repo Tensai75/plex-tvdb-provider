@@ -47,7 +47,7 @@ The provider defaults to **TheTVDB (Aired)**. To use a different order, open the
 
 ## How show matching works
 
-When Plex supplies an external show GUID in a match request, the provider accepts `tvdb://123456`, `imdb://tt1234567`, and `tmdb://123456`. A remote ID must identify one series, and numeric TMDB IDs must match that series' TMDB cross-reference. Metadata and episode ordering come from TheTVDB for all three ID formats.
+When Plex supplies an external show GUID in a match request, the provider accepts `tvdb://123456`, `imdb://tt1234567`, and `tmdb://123456`. IMDb and TMDB IDs must match the corresponding cross-reference on exactly one series. Metadata and episode ordering come from TheTVDB for all three ID formats.
 
 When Plex sends a media path with an IMDb ID, the provider can also use that ID. A show folder can include `imdb-tt1234567`, `{imdb-tt1234567}`, `[imdb-tt1234567]`, or `(imdb-tt1234567)`. A `{tvdb-123456}` tag takes precedence if both are present. When Plex sends no supported ID, the provider searches by show title or alias and uses the year when available.
 
