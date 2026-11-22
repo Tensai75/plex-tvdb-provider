@@ -15,7 +15,7 @@ You need Docker with Compose, Plex Media Server 1.43 or newer, and a [TheTVDB v4
    curl -fsS http://localhost:3000/health
    ```
 
-The Compose file pulls a versioned Linux amd64 image from GitHub Container Registry. Docker keeps the cache in the `tvdb-cache` volume across container updates. Set `PLEX_TVDB_PORT` in `.env` if host port 3000 is already in use. Keep the port reachable from your Plex servers on your local network. The provider has no client authentication.
+The Compose file pins the Linux amd64 image to `v0.1.0`. GitHub Container Registry also offers a `latest` tag for the most recently published stable release. Docker keeps the cache in the `tvdb-cache` volume across container updates. Set `PLEX_TVDB_PORT` in `.env` if host port 3000 is already in use. Keep the port reachable from your Plex servers on your local network. The provider has no client authentication.
 
 If you prefer plain Docker, use the same `.env` file and the default port.
 
@@ -35,12 +35,23 @@ docker run -d --name plex-tvdb-provider --restart unless-stopped \
 
 Register the same provider URL on each Plex server that should use it. See [Plex's Custom Metadata Providers guide](https://forums.plex.tv/t/announcement-custom-metadata-providers/934384/) for the distinction between providers and agents.
 
+## How show matching works
+
+When Plex sends a media path containing an IMDb ID in braces, such as `Show Name (2020) {imdb-tt1234567}/`, the provider looks up that IMDb ID in TheTVDB and uses it when it identifies exactly one series. A `{tvdb-123456}` tag also works and takes precedence if both are present. When Plex sends no supported ID, the provider searches by show title or alias and uses the year when available. Keep episodes numbered according to TheTVDB Aired order.
+
+In **Sonarr → Settings → Media Management**, enable **Show Advanced**. This **Series Folder Format** adds the IMDb ID.
+
+```text
+{Series CleanTitleWithoutYear} ({Series Year}) {imdb-{ImdbId}}
+```
+
+Keep the outer braces and the `imdb-` prefix. [Sonarr supports the IMDb token for series folders](https://wiki.servarr.com/sonarr/settings#series-folder-format). [Radarr also supports IMDb IDs in movie folder names](https://wiki.servarr.com/radarr/settings#movie-folder-format). This provider serves TV libraries.
+
 ## Limits and troubleshooting
 
 - The provider supports TV shows with TheTVDB **Aired** episode order. DVD and alternate orders are outside its current scope.
 - Custom agents use their own Plex GUIDs. Plex's [cloud watch-state and ratings sync](https://support.plex.tv/articles/sync-watch-state-and-ratings/) requires the built-in Plex TV Series agent for TV libraries.
 - If Plex cannot add the provider, verify that the exact URL is reachable from the Plex server. The root URL should return a JSON object containing `MediaProvider`. If it registers but cannot fetch a show, run `docker compose logs plex-tvdb-provider` to check for TheTVDB authentication, connectivity, or rate-limit errors. `/health` checks that the local process is serving HTTP. `/stats` shows cached show and episode counts.
-- Folder IDs such as `{tvdb-123456}` or `{imdb-tt1234567}` can help disambiguate shows when Plex sends the path. Keep season and episode filenames aligned with TheTVDB Aired numbering.
 
 ## Build and test from source
 
