@@ -5,13 +5,19 @@ const identifier = 'tv.plex.agents.custom.plextvdbprovider.tvdb';
 const metadataPath = '/library/metadata';
 const kinds = { 2: 'show', 3: 'season', 4: 'episode' };
 
+/** Validates a Plex season, episode, or paging number. */
 const coordinates = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+/** Validates a positive TheTVDB numeric ID. */
 const numericId = (value) => /^[1-9][0-9]{0,14}$/.test(String(value));
+/** Normalizes a title or alias for exact comparison after ignoring punctuation. */
 const normalize = (name) => String(name || '').normalize('NFKC').toLowerCase()
   .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+/** Builds the Plex rating key from the item type and TheTVDB ID. */
 const itemKey = (type, id) => `${type}-${id}`;
+/** Builds a stable Plex GUID within this provider’s namespace. */
 const guid = (type, id) => `${identifier}://${type}/${itemKey(type, id)}`;
 
+/** Extracts the base language requested by Plex, such as fr from fr-CA. */
 function languageCode(value) {
   if (typeof value !== 'string' || !value) return undefined;
   try {
@@ -22,6 +28,7 @@ function languageCode(value) {
   }
 }
 
+/** Builds the external GUID list that Plex and sync tools can use to identify an item. */
 function externalIds(record) {
   const ids = new Set([`tvdb://${record.id}`]);
   for (const remote of record.remoteIds || []) {
@@ -34,6 +41,7 @@ function externalIds(record) {
   return [...ids].map((id) => ({ id }));
 }
 
+/** Formats the metadata fields and artwork shared by shows, seasons, and episodes. */
 function describe(type, record, title, date) {
   if (!numericId(record.id)) throw new RequestError(502, 'TVDB returned an invalid item ID');
   const ratingKey = itemKey(type, record.id);
@@ -51,6 +59,7 @@ function describe(type, record, title, date) {
   };
 }
 
+/** Formats the Plex parent or grandparent reference for an item. */
 function ancestor(type, item, prefix) {
   return {
     [`${prefix}Type`]: type,
@@ -61,16 +70,19 @@ function ancestor(type, item, prefix) {
   };
 }
 
+/** Wraps a list of metadata items in Plex’s paginated response format. */
 function envelope(items, offset = 0, totalSize = items.length) {
   return { MediaContainer: { identifier, offset, size: items.length, totalSize, Metadata: items } };
 }
 
+/** Selects the official airing-order seasons, including season zero for specials. */
 function airedSeasons(series) {
   return (series.seasons || []).filter((season) =>
     numericId(season.id) && coordinates(season.number) && ['official', 'default'].includes(season.type?.type)
   ).sort((a, b) => a.number - b.number);
 }
 
+/** Formats a show and advertises TheTVDB Aired ordering. */
 function showItem(series) {
   return {
     ...describe('show', series, series.name, series.firstAired),
@@ -78,6 +90,7 @@ function showItem(series) {
   };
 }
 
+/** Formats a season with its number and parent show. */
 function seasonItem(series, season) {
   return {
     ...describe('season', season, season.name || (season.number === 0 ? 'Specials' : `Season ${season.number}`), ''),
@@ -86,6 +99,7 @@ function seasonItem(series, season) {
   };
 }
 
+/** Formats an episode with its season number, ancestry, and runtime in milliseconds. */
 function episodeItem(series, season, episode) {
   return {
     ...describe('episode', episode, episode.name || `Episode ${episode.number}`, episode.aired),
@@ -97,10 +111,12 @@ function episodeItem(series, season, episode) {
   };
 }
 
+/** Embeds child metadata in an item for Plex requests that ask for it. */
 function withChildren(item, items) {
   return { ...item, Children: { size: items.length, Metadata: items } };
 }
 
+/** Parses a bounded Plex match request and reports malformed bodies as client errors. */
 async function readBody(request) {
   const chunks = [];
   let size = 0;
@@ -118,8 +134,10 @@ async function readBody(request) {
   }
 }
 
+/** Creates an unstarted Plex HTTP provider using the supplied TheTVDB client settings. */
 export function createProvider(config) {
   const tvdb = tvdbClient(config);
+  /** Fetches a show and applies the requested translation when TheTVDB has it. */
   async function series(id, language) {
     const record = await tvdb(`/series/${id}/extended`);
     if (!language || languageCode(record.originalLanguage) === language) return record;
@@ -137,16 +155,21 @@ export function createProvider(config) {
       return record;
     }
   }
+  /** Fetches the extended season record, including its episodes. */
   const season = (id) => tvdb(`/seasons/${id}/extended`);
+  /** Reads a season’s episode list, treating a missing list as empty. */
   const episodes = (s) => Array.isArray(s.episodes) ? s.episodes : [];
+  /** Accepts either a JSON boolean or 1 for a Plex include flag. */
   const include = (value) => value === true || String(value) === '1';
 
+  /** Rejects episode orders this provider does not implement. */
   function requireAired(order) {
     if (order && !['default', 'official', 'aired', 'tvdbAiring'].includes(order)) {
       throw new RequestError(404, 'Only TVDB Aired ordering is available');
     }
   }
 
+  /** Loads a known TheTVDB item and its Plex hierarchy. */
   async function load(kind, id, language) {
     if (kind === 'show') {
       const s = await series(id, language);
@@ -168,6 +191,7 @@ export function createProvider(config) {
     return { item: episodeItem(s, row, e), children: [] };
   }
 
+  /** Resolves the show by file ID first, then by title and year when no ID is present. */
   async function findSeries(title, year, manual, file, language) {
     const path = typeof file === 'string' ? file : '';
     const namedId = path.match(/\{tvdb-([1-9][0-9]{0,14})\}/i)?.[1];
@@ -206,6 +230,7 @@ export function createProvider(config) {
     return Promise.all([...new Set(picks)].slice(0, 8).map((id) => series(id, language)));
   }
 
+  /** Translates a Plex match request into candidates for a show, season, or episode. */
   async function match(body, language) {
     const kind = Number.isInteger(body.type) ? kinds[body.type] : undefined;
     if (!kind) throw new RequestError(400, 'Unsupported metadata type');
@@ -248,6 +273,7 @@ export function createProvider(config) {
     return envelope(manual || matches.length === 1 ? matches : []);
   }
 
+  /** Applies Plex’s header or query-string paging parameters to a result list. */
   function page(request, url, rows) {
     const param = (key) => url.searchParams.get(key) ?? request.headers[key.toLowerCase()];
     const start = Number(param('X-Plex-Container-Start') ?? 0);
@@ -256,6 +282,7 @@ export function createProvider(config) {
     return envelope(rows.slice(start, start + size), start, rows.length);
   }
 
+  /** Routes Plex discovery, matching, and metadata requests and formats errors. */
   const server = createServer(async (request, response) => {
     let path;
     let status = 200;

@@ -6,6 +6,7 @@ services:
     environment:
       TVDB_API_KEY: ${TVDB_API_KEY:?Set TVDB_API_KEY in .env}
       TVDB_PIN: ${TVDB_PIN:-}
+      TVDB_CACHE_TTL_HOURS: "${TVDB_CACHE_TTL_HOURS:-24}"
     volumes:
       - tvdb-cache:/data
     restart: unless-stopped

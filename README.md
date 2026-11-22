@@ -1,6 +1,6 @@
 # Plex TVDB Provider
 
-A self-hosted [TheTVDB](https://thetvdb.com/) metadata provider for Plex TV libraries. It supplies show, season, and episode metadata and artwork using TheTVDB Aired episode order, including specials. Multiple Plex servers can use one instance and share its 24-hour SQLite cache.
+A self-hosted [TheTVDB](https://thetvdb.com/) metadata provider for Plex TV libraries. It supplies show, season, and episode metadata and artwork using TheTVDB Aired episode order, including specials. Multiple Plex servers can use one instance and share a persistent SQLite cache. The provider coalesces concurrent requests for the same metadata and honors TheTVDB rate-limit responses.
 
 ## Install with Docker Compose
 
@@ -24,6 +24,12 @@ docker run -d --name plex-tvdb-provider --restart unless-stopped \
   --env-file .env -p 3000:3000 -v plex-tvdb-cache:/data \
   ghcr.io/marciocm/plex-tvdb-provider:v0.1.0
 ```
+
+## Configure the cache
+
+Set `TVDB_CACHE_TTL_HOURS` in `.env` to a non-negative whole number. The default is `24`. Use `1` or `6` for a shorter cache, or `0` to disable it. The duration is measured from the last fetch from TheTVDB. Reading an entry does not extend its lifetime. Run `docker compose up -d` after editing `.env` to apply the change.
+
+With the cache disabled, the provider leaves the SQLite volume untouched and still shares simultaneous requests for the same metadata. TheTVDB request pacing and rate-limit backoff still apply.
 
 ## Add the provider in Plex
 

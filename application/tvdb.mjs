@@ -1,8 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
+/** Carries an HTTP status and optional retry delay for the Plex response. */
 export class RequestError extends Error {
   constructor(status, message, retryAfter) {
     super(message);
@@ -11,27 +13,31 @@ export class RequestError extends Error {
   }
 }
 
+/**
+ * Creates an authenticated TheTVDB client with request pacing and an optional SQLite cache.
+ * Metadata age is measured from the upstream fetch. A zero cacheTtlMs bypasses SQLite.
+ */
 export function tvdbClient({
   api_key, pin, cachePath = ':memory:', baseUrl = 'https://api4.thetvdb.com/v4',
-  now = Date.now, spacingMs = 250,
+  cacheTtlMs = DAY_MS, now = Date.now, spacingMs = 250,
 }) {
-  const db = new DatabaseSync(cachePath);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS responses (
+  const db = cacheTtlMs > 0 ? new DatabaseSync(cachePath) : undefined;
+  db?.exec(`
+    CREATE TABLE IF NOT EXISTS metadata_responses (
       path TEXT PRIMARY KEY,
-      expires_at INTEGER NOT NULL,
+      fetched_at INTEGER NOT NULL,
       payload TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS response_expiry ON responses (expires_at);
+    CREATE INDEX IF NOT EXISTS metadata_response_age ON metadata_responses (fetched_at);
   `);
-  const read = db.prepare('SELECT payload FROM responses WHERE path = ? AND expires_at > ?');
-  const write = db.prepare(`
-    INSERT INTO responses (path, expires_at, payload) VALUES (?, ?, ?)
-    ON CONFLICT (path) DO UPDATE SET expires_at = excluded.expires_at, payload = excluded.payload
+  const read = db?.prepare('SELECT payload FROM metadata_responses WHERE path = ? AND fetched_at > ?');
+  const write = db?.prepare(`
+    INSERT INTO metadata_responses (path, fetched_at, payload) VALUES (?, ?, ?)
+    ON CONFLICT (path) DO UPDATE SET fetched_at = excluded.fetched_at, payload = excluded.payload
   `);
-  const expire = db.prepare('DELETE FROM responses WHERE expires_at <= ?');
-  const cacheCounts = db.prepare(`
-    WITH fresh AS (SELECT path, payload FROM responses WHERE expires_at > ?),
+  const expire = db?.prepare('DELETE FROM metadata_responses WHERE fetched_at <= ?');
+  const cacheCounts = db?.prepare(`
+    WITH fresh AS (SELECT path, payload FROM metadata_responses WHERE fetched_at > ?),
     episode_ids AS (
       SELECT json_extract(payload, '$.id') AS id
       FROM fresh WHERE path GLOB '/episodes/[0-9]*/extended'
@@ -52,6 +58,7 @@ export function tvdbClient({
   let nextStart = Promise.resolve();
   let backoffUntil = 0;
 
+  /** Spaces upstream requests and observes any active rate-limit delay. */
   async function request(path, options) {
     const scheduled = nextStart;
     nextStart = scheduled.then(() => sleep(spacingMs));
@@ -74,6 +81,7 @@ export function tvdbClient({
     return response;
   }
 
+  /** Reuses the login token and shares a single login among concurrent callers. */
   async function token() {
     if (authorization && now() < tokenExpires) return authorization;
     login ??= (async () => {
@@ -94,6 +102,7 @@ export function tvdbClient({
     return login;
   }
 
+  /** Fetches metadata, retries once on an expired login, and caches successful responses. */
   async function fetchMetadata(path) {
     let used = await token();
     let response = await request(path, { headers: { Authorization: 'Bearer ' + used } });
@@ -106,24 +115,29 @@ export function tvdbClient({
     if (!response.ok) throw new RequestError(502, `TVDB metadata returned HTTP ${response.status}`);
     const data = (await response.json()).data;
     if (!data || typeof data !== 'object') throw new RequestError(502, 'TVDB returned an invalid result');
-    const fetchedAt = now();
-    if (fetchedAt >= nextPrune) {
-      expire.run(fetchedAt);
-      nextPrune = fetchedAt + 60 * 60 * 1000;
+    if (db) {
+      const fetchedAt = now();
+      if (fetchedAt >= nextPrune) {
+        expire.run(fetchedAt - cacheTtlMs);
+        nextPrune = fetchedAt + HOUR_MS;
+      }
+      write.run(path, fetchedAt, JSON.stringify(data));
     }
-    write.run(path, fetchedAt + DAY_MS, JSON.stringify(data));
     return data;
   }
 
+  /** Returns fresh cached metadata or shares an upstream fetch already in progress. */
   async function get(path) {
-    const cached = read.get(path, now());
+    const cached = read?.get(path, now() - cacheTtlMs);
     if (cached) return JSON.parse(cached.payload);
     if (!inFlight.has(path)) {
       inFlight.set(path, fetchMetadata(path).finally(() => inFlight.delete(path)));
     }
     return inFlight.get(path);
   }
-  get.close = () => db.close();
-  get.cacheCounts = () => cacheCounts.get(now());
+  /** Releases the SQLite connection when the provider closes. */
+  get.close = () => db?.close();
+  /** Counts unexpired items without contacting TheTVDB. */
+  get.cacheCounts = () => cacheCounts?.get(now() - cacheTtlMs) ?? { cachedShows: 0, cachedEpisodes: 0 };
   return get;
 }

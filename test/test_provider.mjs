@@ -182,7 +182,7 @@ test('Plex discovery and TVDB matching, hierarchy, paging, misses and auth recov
   assert.equal((await match({ type: 2, title: 'Name', year: 2021 })).MediaContainer.size, 0);
 });
 
-test('three clients coalesce, restart preserves the cache and reads never renew its TTL', async (t) => {
+test('cache coalescing, persistence, default and configured expiration, and disabling', async (t) => {
   const { mkdtemp, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -237,6 +237,25 @@ test('three clients coalesce, restart preserves the cache and reads never renew 
   assert.equal(await title(secondBase), 'Revision 2');
   assert.equal(calls, 2);
   assert.equal(logins, 2);
+
+  const sixHours = 6 * 60 * 60 * 1000;
+  const shorter = createProvider({ ...config, cacheTtlMs: sixHours });
+  const shorterBase = await listen(shorter);
+  t.after(() => shorter.close());
+  now += sixHours - 1;
+  assert.equal(await title(shorterBase), 'Revision 2');
+  now += 1;
+  assert.equal(await title(shorterBase), 'Revision 3');
+
+  const disabled = createProvider({ ...config, cacheTtlMs: 0 });
+  const disabledBase = await listen(disabled);
+  t.after(() => disabled.close());
+  assert.deepEqual(await Promise.all([title(disabledBase), title(disabledBase)]),
+    ['Revision 4', 'Revision 4']);
+  assert.equal(await title(disabledBase), 'Revision 5');
+  assert.deepEqual(await (await fetch(disabledBase + '/stats')).json(), { cachedShows: 0, cachedEpisodes: 0 });
+  assert.equal(await title(shorterBase), 'Revision 3');
+  assert.equal(calls, 5);
 });
 
 test('TVDB 429 suppresses new upstream requests until Retry-After and a failure is never cached', async (t) => {
