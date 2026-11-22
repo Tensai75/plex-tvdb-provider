@@ -216,14 +216,13 @@ export function createProvider(config) {
       } catch (error) {
         console.warn('Could not verify TVDB episode order', showId, order,
           error instanceof RequestError ? error.status : error.name);
-        return false;
       }
     }
     return false;
   }
 
   /** Advertises Aired and alternate orders with confirmed numbered episodes. */
-  async function showMetadata(show, item = showItem(show)) {
+  async function showMetadata(show, item) {
     const orders = new Map();
     for (const row of seriesSeasons(show)) {
       const id = seasonOrder(row);
@@ -242,6 +241,15 @@ export function createProvider(config) {
   /** Formats requested seasons, retaining the series summary if a season record is missing. */
   async function seasonItems(show, rows) {
     return Promise.all(rows.map(async (row) => seasonItem(show, row, await seasonEpisodes(row.id))));
+  }
+
+  /** Loads requested children before checking which optional orders Plex can offer. */
+  async function itemResult({ item, children, series: show }, includeChildren) {
+    const childItems = includeChildren && item.type !== 'episode'
+      ? (show ? await seasonItems(show, children) : children)
+      : undefined;
+    const result = show ? await showMetadata(show, item) : item;
+    return childItems ? withChildren(result, childItems) : result;
   }
 
   /** Loads a known TheTVDB item and its Plex hierarchy. */
@@ -335,10 +343,8 @@ export function createProvider(config) {
     const external = typeof body.guid === 'string' ? body.guid.match(/^tvdb:\/\/([1-9][0-9]{0,14})$/)?.[1] : null;
     if (external) {
       try {
-        const { item, children, series: show } = await load(kind, external, language, order);
-        const result = show ? await showMetadata(show, item) : item;
-        return envelope([include(body.includeChildren) && kind !== 'episode'
-          ? withChildren(result, show ? await seasonItems(show, children) : children) : result]);
+        const loaded = await load(kind, external, language, order);
+        return envelope([await itemResult(loaded, include(body.includeChildren))]);
       } catch (error) {
         if (error instanceof RequestError && error.status === 404) return envelope([]);
         throw error;
@@ -350,8 +356,8 @@ export function createProvider(config) {
     for (const show of await findSeries(name, kind === 'show' ? body.year : null, manual, body.filename, language)) {
       const seasons = seriesSeasons(show, order ?? defaultOrder);
       if (kind === 'show') {
-        const item = await showMetadata(show);
-        matches.push(include(body.includeChildren) ? withChildren(item, await seasonItems(show, seasons)) : item);
+        const loaded = { item: showItem(show), children: seasons, series: show };
+        matches.push(await itemResult(loaded, include(body.includeChildren)));
       } else if (kind === 'season') {
         const row = seasons.find((item) => item.number === body.index);
         if (!row) continue;
@@ -412,7 +418,8 @@ export function createProvider(config) {
         if (kind === 'episode' && !seasonId && order && order !== defaultOrder) {
           throw new RequestError(404, 'Episode key belongs to Aired order');
         }
-        const { item, children, series: show } = await load(kind, id, language, order, seasonId);
+        const loaded = await load(kind, id, language, order, seasonId);
+        const { item, children, series: show } = loaded;
         if (part === 'children') {
           body = await page(request, url, children, show);
         } else if (part === 'grandchildren') {
@@ -425,9 +432,7 @@ export function createProvider(config) {
           const images = item.Image || [];
           body = { MediaContainer: { identifier, offset: 0, size: images.length, totalSize: images.length, Image: images } };
         } else {
-          const result = show ? await showMetadata(show, item) : item;
-          body = envelope([include(url.searchParams.get('includeChildren')) && kind !== 'episode'
-            ? withChildren(result, show ? await seasonItems(show, children) : children) : result]);
+          body = envelope([await itemResult(loaded, include(url.searchParams.get('includeChildren')))]);
         }
       }
     } catch (error) {

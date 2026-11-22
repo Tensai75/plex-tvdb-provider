@@ -465,6 +465,80 @@ test('a missing season does not hide a cached show or its dated siblings', async
   assert.equal((await fetch(base + showPath + '?includeChildren=1')).status, 502);
 });
 
+test('show requests keep available orders and load requested seasons before optional checks', async (t) => {
+  const dvdFirst = { id: 31, number: 1, seriesId: 1, type: { type: 'dvd' }, episodes: [] };
+  const dvdSecond = { ...dvdFirst, id: 32, number: 2, episodes: aired.episodes };
+  const routes = {
+    '/login': { token: 'fixture-token' },
+    '/series/1/extended': { ...series, seasons: [aired, dvdFirst, dvdSecond] },
+    '/search': [{ tvdb_id: '1', name: 'Example', year: '2021' }],
+    '/seasons/12/extended': aired,
+    '/seasons/31/extended': dvdFirst,
+    '/seasons/32/extended': dvdSecond,
+  };
+  const seasonRequests = [];
+  let firstDvdStatus = 500;
+  let seasonQuota = Infinity;
+  const upstream = createServer((request, response) => {
+    const { pathname } = new URL(request.url, 'http://localhost');
+    if (pathname.startsWith('/seasons/')) {
+      seasonRequests.push(pathname);
+      if (seasonRequests.length > seasonQuota) return response.writeHead(429, { 'Retry-After': '8' }).end();
+      if (pathname === '/seasons/31/extended' && firstDvdStatus) return response.writeHead(firstDvdStatus).end();
+    }
+    const data = routes[pathname];
+    if (!data) return response.writeHead(404).end();
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
+  });
+  const baseUrl = await listen(upstream);
+  t.after(() => upstream.close());
+  const start = async (testCase) => {
+    const provider = createProvider({ api_key: 'fixture-key', baseUrl, spacingMs: 0 });
+    testCase.after(() => provider.close());
+    return listen(provider);
+  };
+  const match = (base, params, includeChildren) => fetch(base + '/library/metadata/matches', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 2, episodeOrder: 'official', includeChildren, ...params }),
+  });
+  const callers = [
+    ['show detail', (base, children) => fetch(base + '/library/metadata/show-1?episodeOrder=official&includeChildren=' + children)],
+    ['title match', (base, children) => match(base, { title: 'Example', year: 2021 }, children)],
+    ['TVDB GUID match', (base, children) => match(base, { guid: 'tvdb://1' }, children)],
+  ];
+
+  for (const [name, call] of callers) {
+    await t.test(name + ' advertises DVD when a later cached season has episodes', async (testCase) => {
+      seasonRequests.length = 0;
+      const base = await start(testCase);
+      const warm = await fetch(base + '/library/metadata/season-32/children');
+      assert.equal(warm.status, 200);
+      assert.equal((await warm.json()).MediaContainer.size, 2);
+      const response = await call(base, 0);
+      assert.equal(response.status, 200);
+      const [show] = (await response.json()).MediaContainer.Metadata;
+      assert.deepEqual(show.SeasonType.map(({ id }) => id), ['official', 'dvd']);
+      assert.deepEqual(seasonRequests, ['/seasons/32/extended', '/seasons/31/extended']);
+    });
+  }
+
+  firstDvdStatus = 0;
+  seasonQuota = 1;
+  for (const [name, call] of callers) {
+    await t.test(name + ' returns Aired children when an optional season hits the rate limit', async (testCase) => {
+      seasonRequests.length = 0;
+      const base = await start(testCase);
+      const response = await call(base, 1);
+      assert.equal(response.status, 200);
+      const [show] = (await response.json()).MediaContainer.Metadata;
+      assert.deepEqual(show.SeasonType.map(({ id }) => id), ['official']);
+      assert.deepEqual(show.Children.Metadata.map(({ ratingKey, originallyAvailableAt }) => [ratingKey, originallyAvailableAt]),
+        [['season-12', '2021-01-01']]);
+      assert.deepEqual(seasonRequests, ['/seasons/12/extended', '/seasons/31/extended']);
+    });
+  }
+});
+
 test('custom provider identifiers preserve case and reject disallowed characters', () => {
   const source = new URL('../application/provider.mjs', import.meta.url).href;
   const command = `
