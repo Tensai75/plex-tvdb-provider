@@ -1,0 +1,56 @@
+name: Test and publish container
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      TVDB_API_KEY: compose-smoke-test
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build the container
+        run: docker build -t "$(docker compose config --images)" .
+      - name: Test Plex routes and TVDB caching
+        run: >-
+          docker run --rm
+          --mount "type=bind,source=$PWD,target=/src,readonly"
+          "$(docker compose config --images)"
+          node --test /src/test/test_provider.mjs
+      - name: Start the Compose example with a fresh volume
+        run: |
+          docker compose up -d --pull never --wait --wait-timeout 60
+          curl -fsS http://127.0.0.1:3000/ | jq -e '.MediaProvider.identifier == "tv.plex.agents.custom.marciocm.tvdb"'
+          curl -fsS http://127.0.0.1:3000/stats | jq -e '.cachedShows == 0 and .cachedEpisodes == 0'
+      - name: Stop the test container
+        if: always()
+        run: docker compose down --volumes
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Publish the versioned image to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME}"
+          docker build --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" --label "org.opencontainers.image.licenses=MIT" -t "$image" .
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$image"
