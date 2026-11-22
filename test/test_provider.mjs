@@ -245,7 +245,8 @@ test('uses Aired episode membership and season dates, and checks localized title
 
   const plainShow = await fetch(base + '/library/metadata/show-1');
   assert.equal(plainShow.status, 200);
-  assert.deepEqual(seasonFetches, []);
+  assert.deepEqual(seasonFetches, ['/seasons/39/extended']);
+  seasonFetches.length = 0;
   const page = await fetch(base + '/library/metadata/show-1/children?X-Plex-Container-Size=1');
   assert.equal(page.status, 200);
   const listed = (await page.json()).MediaContainer;
@@ -298,10 +299,20 @@ test('Plex uses one provider for Aired, DVD, Absolute and named episode orders',
   const data = { id: 1, name: 'Example', firstAired: '2021-01-01', defaultSeasonType: 2, seasons: allOrders };
   const shared = { id: 21, seriesId: 1, name: 'Shared episode', aired: '2021-01-01', seasons: [aired, dvd, absolute] };
   const recut = { id: 41, seriesId: 1, name: 'Streaming cut', aired: '2021-04-21', seasons: [streaming] };
+  const placeholder = { id: 50, seriesId: 2, number: 1, type: { id: 3, type: 'absolute' } };
+  const specialsOnly = { id: 51, seriesId: 2, number: 0, type: { id: 4, type: 'alternate' } };
+  const datedRegularSeason = { ...dvd, id: 52, seriesId: 2, number: 2 };
+  const emptyFirstDvdSeason = { ...dvd, id: 53, seriesId: 2 };
   const upstreamRoutes = {
     '/login': { token: 'fixture-token' },
     '/search': [{ tvdb_id: '1', name: 'Example', year: '2021' }],
     '/series/1/extended': data,
+    '/series/2/extended': { id: 2, name: 'Partially populated show', firstAired: '2021-01-01',
+      seasons: [{ ...aired, id: 49, seriesId: 2 }, placeholder, specialsOnly, datedRegularSeason, emptyFirstDvdSeason] },
+    '/seasons/50/extended': { ...placeholder, episodes: [] },
+    '/seasons/51/extended': { ...specialsOnly, episodes: [{ id: 63, number: 1 }] },
+    '/seasons/52/extended': { ...datedRegularSeason, episodes: [{ id: 62, number: 1 }] },
+    '/seasons/53/extended': { ...emptyFirstDvdSeason, episodes: [] },
     '/seasons/30/extended': { ...aired, episodes: [{ ...shared, number: 1 }] },
     '/seasons/31/extended': { ...dvd, episodes: [{ ...shared, number: 2 }] },
     '/seasons/32/extended': { ...absolute, episodes: [{ ...shared, number: 11 }] },
@@ -334,6 +345,10 @@ test('Plex uses one provider for Aired, DVD, Absolute and named episode orders',
   assert.equal(discovery.title, 'TheTVDB');
   const [show] = await get(showPath + '?includeChildren=1');
   assert.equal(show.ratingKey, 'show-1');
+  const [withPlaceholders] = await get('/library/metadata/show-2');
+  assert.deepEqual(withPlaceholders.SeasonType.map(({ id }) => id), ['official', 'dvd']);
+  const [matchedWithPlaceholders] = await match({ type: 2, guid: 'tvdb://2', includeChildren: 1 });
+  assert.deepEqual(matchedWithPlaceholders.SeasonType, withPlaceholders.SeasonType);
   assert.deepEqual(show.SeasonType.map(({ id, title }) => [id, title]), [
     ['official', 'TheTVDB (Aired)'], ['dvd', 'TheTVDB (DVD Volumes)'],
     ['absolute', 'TheTVDB (Absolute)'], ['tvdbOrder4', 'TheTVDB (Streaming Order)'],
@@ -381,6 +396,9 @@ test('Plex uses one provider for Aired, DVD, Absolute and named episode orders',
   const [airedAgain] = await get('/library/metadata/episode-21');
   assert.equal(airedAgain.ratingKey, 'episode-21');
   assert.equal(airedAgain.index, 1);
+  const [airedWithOrder] = await get('/library/metadata/episode-21?episodeOrder=official');
+  assert.deepEqual(airedWithOrder, airedAgain);
+  await get('/library/metadata/episode-21?episodeOrder=tvdbDVD', undefined, 404);
   assert.deepEqual(await get(showPath + '/children?episodeOrder=tvdbOrder99'), []);
   assert.deepEqual(await match({ type: 4, guid: 'tvdb://41', episodeOrder: 'official' }), []);
   await get('/library/metadata/episode-41-31', undefined, 404);
@@ -403,7 +421,9 @@ test('a missing season does not hide a cached show or its dated siblings', async
       response.writeHead(missingSeasonStatus).end();
       return;
     }
-    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data: routes[pathname] }));
+    const data = routes[pathname];
+    if (!data) return response.writeHead(404).end();
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data }));
   });
   const baseUrl = await listen(upstream);
   t.after(() => upstream.close());
@@ -494,7 +514,7 @@ test('cache coalescing, persistence, default and configured expiration, and disa
     assert.equal(request.url, '/series/1/extended');
     assert.equal(request.headers.authorization, 'Bearer fixture-token');
     calls++;
-    response.end(JSON.stringify({ data: { ...series, name: 'Revision ' + calls } }));
+    response.end(JSON.stringify({ data: { ...series, seasons: [], name: 'Revision ' + calls } }));
   });
   const baseUrl = await listen(upstream);
   t.after(() => upstream.close());
@@ -561,7 +581,7 @@ test('TVDB 429 suppresses new upstream requests until Retry-After and a failure 
       response.writeHead(429, { 'Retry-After': '12' }).end();
       return;
     }
-    response.end(JSON.stringify({ data: series }));
+    response.end(JSON.stringify({ data: { ...series, seasons: [] } }));
   });
   const baseUrl = await listen(upstream);
   t.after(() => upstream.close());

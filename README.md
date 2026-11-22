@@ -43,7 +43,7 @@ Register the same provider URL on each Plex server that should use it. See [Plex
 
 ## Choose an episode order
 
-The provider defaults to **TheTVDB (Aired)**. To use a different order, open the show in Plex Web and select **Edit → Advanced → Episode ordering**. Plex lists the orders TheTVDB offers for that show, which can include **DVD**, **Absolute**, or named orders such as **Streaming Order**. Match the season and episode numbers in your filenames to the order you choose.
+The provider defaults to **TheTVDB (Aired)**. To use a different order, open the show in Plex Web and select **Edit → Advanced → Episode ordering**. Plex can list **DVD**, **Absolute**, and named orders such as **Streaming Order** when TheTVDB has numbered episodes for that order. Match the season and episode numbers in your filenames to the order you choose.
 
 ## How show matching works
 

@@ -113,22 +113,9 @@ function seriesSeasons(series, order) {
   }).sort((a, b) => a.number - b.number);
 }
 
-/** Formats a show and advertises only the episode orders with season data for that show. */
+/** Formats show metadata shared by lookup, artwork, and match responses. */
 function showItem(series) {
-  const orders = new Map();
-  for (const row of seriesSeasons(series)) {
-    const id = seasonOrder(row);
-    if (orders.has(id)) continue;
-    const label = (id !== defaultOrder && row.type.alternateName) || orderLabels.get(id)
-      || row.type.name || 'Order ' + row.type.id;
-    orders.set(id, { id, source: 'tvdb', tag: label, title: `TheTVDB (${label})` });
-  }
-  const aired = orders.get(defaultOrder);
-  orders.delete(defaultOrder);
-  return {
-    ...describe('show', series, series.name, series.firstAired),
-    SeasonType: [...(aired ? [aired] : []), ...orders.values()],
-  };
+  return describe('show', series, series.name, series.firstAired);
 }
 
 /** Uses the declared season name or the Plex label for a numbered season or specials. */
@@ -217,6 +204,39 @@ export function createProvider(config) {
       if (!(error instanceof RequestError) || error.status !== 404) throw error;
       return [];
     }
+  }
+
+  /** Checks a listed alternate order for an episode that Plex can match by number. */
+  async function hasNumberedEpisodes(showId, order, rows) {
+    for (const row of rows) {
+      if (row.number === 0) continue;
+      try {
+        const members = await seasonEpisodes(row.id);
+        if (members.some((episode) => numericId(episode.id) && coordinates(episode.number))) return true;
+      } catch (error) {
+        console.warn('Could not verify TVDB episode order', showId, order,
+          error instanceof RequestError ? error.status : error.name);
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /** Advertises Aired and alternate orders with confirmed numbered episodes. */
+  async function showMetadata(show, item = showItem(show)) {
+    const orders = new Map();
+    for (const row of seriesSeasons(show)) {
+      const id = seasonOrder(row);
+      if (!orders.has(id)) orders.set(id, []);
+      orders.get(id).push(row);
+    }
+    const types = await Promise.all([...orders].map(async ([id, rows]) => {
+      if (id !== defaultOrder && !await hasNumberedEpisodes(show.id, id, rows)) return null;
+      const { alternateName, name } = rows[0].type;
+      const label = (id !== defaultOrder && alternateName) || orderLabels.get(id) || name || 'Order ' + rows[0].type.id;
+      return { id, source: 'tvdb', tag: label, title: 'TheTVDB (' + label + ')' };
+    }));
+    return { ...item, SeasonType: types.filter(Boolean).sort((a, b) => (b.id === defaultOrder) - (a.id === defaultOrder)) };
   }
 
   /** Formats requested seasons, retaining the series summary if a season record is missing. */
@@ -316,8 +336,9 @@ export function createProvider(config) {
     if (external) {
       try {
         const { item, children, series: show } = await load(kind, external, language, order);
+        const result = show ? await showMetadata(show, item) : item;
         return envelope([include(body.includeChildren) && kind !== 'episode'
-          ? withChildren(item, show ? await seasonItems(show, children) : children) : item]);
+          ? withChildren(result, show ? await seasonItems(show, children) : children) : result]);
       } catch (error) {
         if (error instanceof RequestError && error.status === 404) return envelope([]);
         throw error;
@@ -329,7 +350,7 @@ export function createProvider(config) {
     for (const show of await findSeries(name, kind === 'show' ? body.year : null, manual, body.filename, language)) {
       const seasons = seriesSeasons(show, order ?? defaultOrder);
       if (kind === 'show') {
-        const item = showItem(show);
+        const item = await showMetadata(show);
         matches.push(include(body.includeChildren) ? withChildren(item, await seasonItems(show, seasons)) : item);
       } else if (kind === 'season') {
         const row = seasons.find((item) => item.number === body.index);
@@ -388,6 +409,9 @@ export function createProvider(config) {
         const order = requestedOrder(url.searchParams.get('episodeOrder') || url.searchParams.get('episodeOrdering'));
         const [, kind, id, seasonId, part] = parsed;
         if (seasonId && kind !== 'episode') throw new RequestError(404, 'Unknown endpoint');
+        if (kind === 'episode' && !seasonId && order && order !== defaultOrder) {
+          throw new RequestError(404, 'Episode key belongs to Aired order');
+        }
         const { item, children, series: show } = await load(kind, id, language, order, seasonId);
         if (part === 'children') {
           body = await page(request, url, children, show);
@@ -401,8 +425,9 @@ export function createProvider(config) {
           const images = item.Image || [];
           body = { MediaContainer: { identifier, offset: 0, size: images.length, totalSize: images.length, Image: images } };
         } else {
+          const result = show ? await showMetadata(show, item) : item;
           body = envelope([include(url.searchParams.get('includeChildren')) && kind !== 'episode'
-            ? withChildren(item, show ? await seasonItems(show, children) : children) : item]);
+            ? withChildren(result, show ? await seasonItems(show, children) : children) : result]);
         }
       }
     } catch (error) {
