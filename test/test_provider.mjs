@@ -288,6 +288,63 @@ test('uses Aired episode membership and season dates, and checks localized title
   assert.equal(undated.year, undefined);
 });
 
+test('a missing season does not hide a cached show or its dated siblings', async (t) => {
+  let seriesFetches = 0;
+  let missingSeasonStatus = 404;
+  const routes = {
+    '/login': { token: 'fixture-token' },
+    '/series/1/extended': series,
+    '/seasons/11/extended': special,
+    '/search': [{ tvdb_id: '1', name: 'Example', year: '2021' }],
+  };
+  const upstream = createServer((request, response) => {
+    const { pathname } = new URL(request.url, 'http://localhost');
+    if (pathname === '/series/1/extended') seriesFetches++;
+    if (pathname === '/seasons/12/extended') {
+      response.writeHead(missingSeasonStatus).end();
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data: routes[pathname] }));
+  });
+  const baseUrl = await listen(upstream);
+  t.after(() => upstream.close());
+  const provider = createProvider({ api_key: 'fixture-key', baseUrl, spacingMs: 0 });
+  const base = await listen(provider);
+  t.after(() => provider.close());
+
+  const get = async (path, options) => {
+    const response = await fetch(base + path, options);
+    assert.equal(response.status, 200);
+    return (await response.json()).MediaContainer;
+  };
+  const match = (body) => get('/library/metadata/matches', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 2, includeChildren: 1, ...body }),
+  });
+
+  const showPath = '/library/metadata/show-1';
+  await get(showPath);
+  const [detail] = (await get(showPath + '?includeChildren=1')).Metadata;
+  const [titleMatch] = (await match({ title: 'Example', year: 2021 })).Metadata;
+  const [guidMatch] = (await match({ guid: 'tvdb://1' })).Metadata;
+  const listing = await get(showPath + '/children');
+  for (const show of [detail, titleMatch, guidMatch]) {
+    assert.equal(show.ratingKey, 'show-1');
+  }
+  for (const children of [detail.Children, titleMatch.Children, guidMatch.Children, listing]) {
+    assert.deepEqual(children.Metadata.map((row) => [row.ratingKey, row.originallyAvailableAt]),
+      [['season-11', '2020-12-01'], ['season-12', undefined]]);
+  }
+  assert.equal(seriesFetches, 1);
+  const missingPage = await get(showPath + '/children?X-Plex-Container-Start=1&X-Plex-Container-Size=1');
+  assert.equal(missingPage.totalSize, 2);
+  assert.equal(missingPage.Metadata[0].ratingKey, 'season-12');
+  assert.equal((await fetch(base + '/library/metadata/season-12')).status, 404);
+
+  missingSeasonStatus = 500;
+  assert.equal((await fetch(base + showPath + '?includeChildren=1')).status, 502);
+});
+
 test('custom provider identifiers preserve case and reject disallowed characters', () => {
   const source = new URL('../application/provider.mjs', import.meta.url).href;
   const command = `

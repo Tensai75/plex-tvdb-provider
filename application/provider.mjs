@@ -167,9 +167,16 @@ export function createProvider(config) {
   /** Accepts either a JSON boolean or 1 for a Plex include flag. */
   const include = (value) => value === true || String(value) === '1';
 
-  /** Formats only the requested Aired seasons using their earliest known episode dates. */
+  /** Formats requested Aired seasons, retaining the series summary if a season record is missing. */
   async function seasonItems(show, rows) {
-    return Promise.all(rows.map(async (row) => seasonItem(show, row, episodes(await season(row.id)))));
+    return Promise.all(rows.map(async (row) => {
+      try {
+        return seasonItem(show, row, episodes(await season(row.id)));
+      } catch (error) {
+        if (!(error instanceof RequestError) || error.status !== 404) throw error;
+        return seasonItem(show, row);
+      }
+    }));
   }
 
   /** Rejects episode orders this provider does not implement. */
