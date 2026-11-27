@@ -202,7 +202,9 @@ function requestedOrder(value) {
   if (orderLabels.has(known)) return known;
   const custom = /^tvdborder([1-9][0-9]{0,14})$/i.exec(value);
   if (custom) return 'tvdbOrder' + custom[1];
-  throw new RequestError(404, 'Unknown TheTVDB episode order');
+  console.warn(`Unknown episode order: ${value}`);
+  console.warn(`Falling back to default order: ${defaultOrder}`);
+  return defaultOrder;
 }
 
 /** Returns navigable seasons in the requested order, or across orders for an exact keyed lookup. */
