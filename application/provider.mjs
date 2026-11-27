@@ -159,7 +159,7 @@ function describe(type, record, title, date, { seasonId, country } = {}) {
     ratingKey, key: `${metadataPath}/${ratingKey}`, guid: guid(type, ratingKey), type, title,
     ...(date ? { originallyAvailableAt: date, year: Number(date.slice(0, 4)) } : {}),
     ...(record.originalTitle ? { originalTitle: record.originalTitle } : {}),
-    summary: [record.overview, 'Metadata provided by TheTVDB\nhttps://thetvdb.com/'].filter(Boolean).join('\n\n'),
+    summary: record.overview,
     ...(thumb ? { thumb } : {}),
     ...(art ? { art } : {}),
     ...(rating ? { contentRating: rating } : {}),
