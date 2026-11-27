@@ -179,8 +179,8 @@ test('Plex discovery and TVDB matching, hierarchy, paging, misses and auth recov
   assert.equal(children.totalSize, 3);
   assert.equal(children.Metadata[0].title, 'Pilot');
   assert.deepEqual(await request('/stats'), { cachedShows: 1, cachedEpisodes: 3 });
-  assert.equal((await request(show.key + '/children?episodeOrdering=tmdbAiring', {}, 404)).error,
-    'Unknown TheTVDB episode order');
+  const fallback = await request(show.key + '/children?episodeOrdering=tmdbAiring');
+  assert.deepEqual(fallback.MediaContainer.Metadata.map((x) => x.index), [0, 1]);
   assert.equal((await match({ type: 2, title: 'Name', year: 2021 })).MediaContainer.size, 0);
 });
 
